@@ -1,0 +1,8 @@
+*.aar
+*.apk
+*.onnx
+*.tar.bz2
+.gradle/
+build/
+local.properties
+__pycache__/
