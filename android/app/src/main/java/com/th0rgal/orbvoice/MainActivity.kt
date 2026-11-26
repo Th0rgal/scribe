@@ -210,7 +210,11 @@ private fun OrbVoiceApp(
 
     var notes by remember { mutableStateOf<List<VoiceNote>>(emptyList()) }
     var selectedNote by remember { mutableStateOf<VoiceNote?>(null) }
-    var activeTab by remember { mutableStateOf(VoiceTab.LIVE) }
+    var activeTab by remember { mutableStateOf(VoiceTab.NOTES) }
+    var searchQuery by remember { mutableStateOf("") }
+    var editingNote by remember { mutableStateOf<VoiceNote?>(null) }
+    var editTitle by remember { mutableStateOf("") }
+    var editBody by remember { mutableStateOf("") }
     var showSettings by remember { mutableStateOf(false) }
     var islandExpanded by remember { mutableStateOf(false) }
 
@@ -409,6 +413,95 @@ private fun OrbVoiceApp(
                     },
                     onOpenSettings = { showSettings = true }
                 )
+            } else if (!isCoverScreen && activeTab == VoiceTab.NOTES) {
+                val curEdit = editingNote
+                if (curEdit != null) {
+                    ScribeNoteEditorScreen(
+                        title = editTitle,
+                        body = editBody,
+                        isSynced = curEdit.syncedToSpark,
+                        onTitleChange = { t ->
+                            editTitle = t
+                            val updated = curEdit.copy(title = t, summary = editBody.take(140))
+                            editingNote = updated
+                            scope.launch(Dispatchers.IO) {
+                                VoiceNoteStore.saveNote(context, updated)
+                                HindsightSyncClient.syncNote(
+                                    noteId = updated.id,
+                                    title = t,
+                                    markdown = "# $t\n\n$editBody",
+                                    isVoice = updated.audioPath.isNotBlank(),
+                                    apiToken = orbCfg.hindsightToken
+                                )
+                            }
+                        },
+                        onBodyChange = { b ->
+                            editBody = b
+                            val updated = curEdit.copy(title = editTitle, summary = b.take(140))
+                            editingNote = updated
+                            scope.launch(Dispatchers.IO) {
+                                VoiceNoteStore.saveNote(context, updated)
+                                HindsightSyncClient.syncNote(
+                                    noteId = updated.id,
+                                    title = editTitle,
+                                    markdown = "# $editTitle\n\n$b",
+                                    isVoice = updated.audioPath.isNotBlank(),
+                                    apiToken = orbCfg.hindsightToken
+                                )
+                            }
+                        },
+                        onBack = {
+                            editingNote = null
+                            reloadNotes()
+                        }
+                    )
+                } else {
+                    val filtered = remember(notes, searchQuery) {
+                        val q = searchQuery.trim().lowercase()
+                        if (q.isEmpty()) notes
+                        else notes.filter {
+                            it.title.lowercase().contains(q) ||
+                                it.summary.lowercase().contains(q)
+                        }
+                    }
+                    ScribeNotesListScreen(
+                        notes = filtered,
+                        searchQuery = searchQuery,
+                        onSearchChange = { searchQuery = it },
+                        onSelectNote = { note ->
+                            editingNote = note
+                            editTitle = note.title
+                            editBody = File(note.markdownPath).takeIf { it.exists() }?.readText()
+                                ?: note.segments.joinToString("\n\n") { it.text }
+                        },
+                        onNewTextNote = {
+                            val id = VoiceNoteStore.newNoteId()
+                            val dir = VoiceNoteStore.notesDir(context)
+                            val fresh = VoiceNote(
+                                id = id,
+                                title = "Untitled Note",
+                                createdAtMs = System.currentTimeMillis(),
+                                durationMs = 0L,
+                                audioPath = "",
+                                markdownPath = File(dir, "$id.md").absolutePath,
+                                jsonPath = File(dir, "$id.json").absolutePath,
+                                engineUsed = "text",
+                                speakerCount = 0,
+                                syncedToSpark = false
+                            )
+                            editingNote = fresh
+                            editTitle = ""
+                            editBody = ""
+                        },
+                        onStartVoiceNote = {
+                            activeTab = VoiceTab.LIVE
+                            toggleRecord()
+                        },
+                        onOpenTranslateMode = { activeTab = VoiceTab.TRANSLATE },
+                        onToggleTheme = onToggleTheme,
+                        isDark = isDarkTheme
+                    )
+                }
             } else {
                 PhoneAndCoverBody(
                     recState = recState,

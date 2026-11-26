@@ -4,51 +4,10 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Scribe</title>
-  <link rel="stylesheet" href="/styles.css" />
+  <script type="module" crossorigin src="/assets/index-DW_cFcCt.js"></script>
+  <link rel="stylesheet" crossorigin href="/assets/index-wmCBR-9F.css">
 </head>
 <body>
-  <div id="app" class="scribe-shell">
-    <aside class="note-rail" id="note-rail">
-      <div class="rail-header">
-        <span class="rail-title">Notes</span>
-        <div class="rail-actions">
-          <button id="btn-new" class="icon-btn" title="New Note (Ctrl+N)">+</button>
-          <button id="btn-sync" class="icon-btn" title="Sync to Hindsight (thomas/scribe)">↻</button>
-          <button id="btn-theme" class="icon-btn" title="Toggle Dark/Light Mode">◐</button>
-        </div>
-      </div>
-      <div class="rail-search">
-        <input id="search-input" type="search" placeholder="Search notes..." autocomplete="off" />
-      </div>
-      <div id="note-list" class="note-list"></div>
-      <div id="sync-footer" class="sync-footer">● Hindsight: thomas/scribe</div>
-    </aside>
-
-    <main class="canvas">
-      <header class="canvas-bar">
-        <div class="canvas-meta">
-          <span id="note-path" class="note-path">No note selected</span>
-          <span id="sync-pill" class="sync-pill"></span>
-        </div>
-        <div class="mode-tabs">
-          <button class="mode-btn active" data-mode="split">Split</button>
-          <button class="mode-btn" data-mode="edit">Edit</button>
-          <button class="mode-btn" data-mode="preview">Preview</button>
-          <button id="btn-delete" class="icon-btn danger" title="Delete Note">✕</button>
-        </div>
-      </header>
-
-      <div id="voice-bar" class="voice-bar hidden">
-        <span class="voice-badge">🎙 Voice Note</span>
-        <audio id="voice-audio" controls></audio>
-      </div>
-
-      <section id="workspace" class="workspace mode-split">
-        <textarea id="editor" class="editor" placeholder="Write in Markdown & LaTeX ($E = mc^2$)..." spellcheck="true"></textarea>
-        <article id="preview" class="preview"></article>
-      </section>
-    </main>
-  </div>
-  <script type="module" src="/app.js"></script>
+  <div id="root"></div>
 </body>
 </html>
