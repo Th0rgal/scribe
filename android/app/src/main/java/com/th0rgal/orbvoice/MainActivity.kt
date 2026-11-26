@@ -18,6 +18,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -95,10 +96,12 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -143,6 +146,9 @@ class MainActivity : ComponentActivity() {
                 WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
         }
         refreshCutoutMetrics()
+        // Pre-warm Hexagon V79 NPU speaker engine + local ASR model in background (16 GB RAM)
+        // so tapping Record starts capture instantaneously (< 50ms)!
+        ScribeEnginePool.prewarmAsync(this)
 
         setContent {
             val prefs = remember { getSharedPreferences("orb_voice_prefs", Context.MODE_PRIVATE) }
@@ -326,6 +332,7 @@ private fun OrbVoiceApp(
         val updated = orbCfg.copy(translateLangA = langA, translateLangB = langB)
         OrbRouterConfig.save(context, updated)
         orbCfg = updated
+        ScribeEnginePool.prewarmAsync(context)
     }
 
     fun shareFile(path: String, mimeType: String, title: String) {
@@ -481,13 +488,30 @@ private fun OrbVoiceApp(
                 shareFile(note.audioPath, mime, "Share Audio Recording")
             },
             onDeepAudioPolish = {
-                if (!orbCfg.isConfigured) {
-                    showSettings = true
-                    showNotice("Set your Orb Router API key in Settings first")
-                    return@NoteDetailSheet
-                }
                 deepPolishingNoteId = note.id
                 scope.launch {
+                    val localReady = withContext(Dispatchers.IO) { LocalQwen3ServerClient.isHealthy() }
+                    if (localReady) {
+                        val localRes = withContext(Dispatchers.IO) {
+                            LocalQwen3ServerClient.deepPolishNoteLocally(note)
+                        }
+                        deepPolishingNoteId = null
+                        localRes.fold(
+                            onSuccess = { updated ->
+                                withContext(Dispatchers.IO) { VoiceNoteStore.saveNote(context, updated) }
+                                reloadNotes()
+                                showNotice("Local Deep Polish complete (Qwen3-1.7B IQ4_XS · 4.4% WER)")
+                            },
+                            onFailure = { err -> showNotice("Local polish failed: ${err.message}") }
+                        )
+                        return@launch
+                    }
+                    if (!orbCfg.isConfigured) {
+                        deepPolishingNoteId = null
+                        showSettings = true
+                        showNotice("Start local Qwen3-1.7B or set Orb Router API key in Settings")
+                        return@launch
+                    }
                     val res = withContext(Dispatchers.IO) {
                         OrbRouterClient.deepAudioRetranscribe(orbCfg, note)
                     }
@@ -563,8 +587,9 @@ private fun OrbVoiceApp(
                     .apply()
                 OrbRouterConfig.save(context, newOrbCfg)
                 orbCfg = OrbRouterConfig.load(context)
+                ScribeEnginePool.prewarmAsync(context)
                 showSettings = false
-                showNotice("Saved Orb Router & Spark settings")
+                showNotice("Saved Scribe settings")
             },
             onDismiss = { showSettings = false }
         )
@@ -662,73 +687,126 @@ private fun DynamicIslandRecordingPill(
 ) {
     val density = LocalDensity.current
     val speakerColors = LocalOrbPalette.current.speakerColors
-    val activeColor = recState.activeSpeakerIndex?.let { speakerColors[it % speakerColors.size] } ?: OrbRed
-    val cutoutWdp = with(density) { (cutoutRect?.width() ?: 96).toDp() }
-    val cutoutHdp = with(density) { (cutoutRect?.height() ?: 92).toDp() }
+    val activeIdx = recState.activeSpeakerIndex
+    val activeColor = activeIdx?.let { speakerColors[it % speakerColors.size] } ?: OrbRed
+    val activeLabel = activeIdx?.let { recState.speakerNames[it] ?: "S${it + 1}" } ?: "REC"
+
+    // Razr 60 Ultra screen is 408dp wide; status-bar icons occupy ~0..105dp (left) and ~305..408dp (right).
+    // Keeping total island width at ~186dp (62 + 42 + 62 + 20 pad) centers it cleanly between the
+    // left/right system status icons while wrapping the physical punch-hole camera dead-center.
+    val cutoutWdp = with(density) { (cutoutRect?.width() ?: 116).toDp() }
+    val cutoutHdp = with(density) { (cutoutRect?.height() ?: 120).toDp() }
+    val cameraDeadZone = (cutoutWdp + 4.dp).coerceIn(38.dp, 46.dp)
+    val topRowHeight = (cutoutHdp - 6.dp).coerceIn(32.dp, 38.dp)
+    val wingWidth = 62.dp
+    val islandContentWidth = wingWidth * 2 + cameraDeadZone
 
     Box(modifier = modifier.padding(top = 4.dp)) {
         Surface(
-            shape = RoundedCornerShape(24.dp),
-            color = if (expanded) OrbSurface.copy(alpha = 0.94f) else androidx.compose.ui.graphics.Color(0xFF000000),
-            border = BorderStroke(
-                1.dp,
-                if (expanded) OrbBorder else androidx.compose.ui.graphics.Color.White.copy(alpha = 0.14f)
-            ),
+            shape = RoundedCornerShape(22.dp),
+            color = androidx.compose.ui.graphics.Color(0xFF000000),
+            border = BorderStroke(1.dp, androidx.compose.ui.graphics.Color.White.copy(alpha = 0.16f)),
             modifier = Modifier.animateContentSize()
         ) {
-            if (!expanded) {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier
+                    .clickable(onClick = onToggleExpand)
+                    .padding(horizontal = 10.dp)
+            ) {
+                // Row 1: Symmetric camera-hugging header (Speaker dot+label | #000000 Camera | Timer+chevron)
                 Row(
-                    modifier = Modifier
-                        .clickable(onClick = onToggleExpand)
-                        .height(cutoutHdp.coerceAtLeast(34.dp))
-                        .padding(horizontal = 12.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    modifier = Modifier.height(topRowHeight),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Box(modifier = Modifier.size(7.dp).clip(CircleShape).background(activeColor))
-                    Spacer(modifier = Modifier.width(cutoutWdp.coerceAtLeast(28.dp)))
-                    Text(
-                        text = VoiceNoteStore.formatTimestamp(recState.elapsedMs),
-                        style = MaterialTheme.typography.labelSmall,
-                        color = androidx.compose.ui.graphics.Color.White
-                    )
-                    Icon(
-                        imageVector = Icons.Rounded.ExpandMore,
-                        contentDescription = "Expand",
-                        tint = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.72f),
-                        modifier = Modifier.size(14.dp)
-                    )
+                    Row(
+                        modifier = Modifier.width(wingWidth),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(7.dp)
+                                .clip(CircleShape)
+                                .background(activeColor)
+                        )
+                        Text(
+                            text = activeLabel,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.88f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+
+                    // Pure #000000 dead-zone centered over the physical punch-hole camera
+                    Spacer(modifier = Modifier.width(cameraDeadZone))
+
+                    Row(
+                        modifier = Modifier.width(wingWidth),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.End
+                    ) {
+                        Text(
+                            text = VoiceNoteStore.formatTimestamp(recState.elapsedMs),
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontFeatureSettings = "tnum"
+                            ),
+                            color = androidx.compose.ui.graphics.Color.White
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Icon(
+                            imageVector = Icons.Rounded.ExpandMore,
+                            contentDescription = if (expanded) "Collapse" else "Expand",
+                            tint = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.68f),
+                            modifier = Modifier.size(14.dp)
+                        )
+                    }
                 }
-            } else {
-                Row(
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(activeColor))
-                    Text(
-                        text = VoiceNoteStore.formatTimestamp(recState.elapsedMs),
-                        style = MaterialTheme.typography.labelSmall,
-                        color = OrbFgStrong
+
+                // Row 2: Extended-notification Murmure fluid 120 FPS waveform directly under the camera lens
+                MurmureFluidWaveform(
+                    barCount = 26,
+                    isProcessing = recState.isProcessing,
+                    modifier = Modifier
+                        .width(islandContentWidth)
+                        .height(20.dp)
+                        .padding(bottom = 7.dp)
+                )
+
+                // Row 3 (Expanded): Quick actions below the waveform
+                if (expanded) {
+                    HorizontalDivider(
+                        color = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.10f),
+                        thickness = 1.dp,
+                        modifier = Modifier.width(islandContentWidth)
                     )
-                    Text(
-                        text = "Stream",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = OrbBlue,
-                        modifier = Modifier.clickable(onClick = onShowStream).padding(horizontal = 4.dp)
-                    )
-                    Text(
-                        text = "Stop",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = OrbRed,
-                        modifier = Modifier.clickable(onClick = onStop).padding(horizontal = 4.dp)
-                    )
-                    Icon(
-                        imageVector = Icons.Rounded.ExpandMore,
-                        contentDescription = "Collapse",
-                        tint = OrbFgMuted,
-                        modifier = Modifier.size(16.dp).clickable(onClick = onToggleExpand)
-                    )
+                    Row(
+                        modifier = Modifier
+                            .width(islandContentWidth)
+                            .padding(vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            text = "Live Stream",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = OrbBlue,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable(onClick = onShowStream)
+                                .padding(horizontal = 8.dp, vertical = 4.dp)
+                        )
+                        Text(
+                            text = "Stop & Save",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = OrbRed,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable(onClick = onStop)
+                                .padding(horizontal = 8.dp, vertical = 4.dp)
+                        )
+                    }
                 }
             }
         }
@@ -829,13 +907,21 @@ private fun PhoneAndCoverBody(
     onRenameLiveSpeaker: (Int, String) -> Unit,
     onOpenSettings: () -> Unit
 ) {
+    val topExtraPad by animateDpAsState(
+        targetValue = when {
+            isCoverScreen -> 8.dp
+            recState.isRecording -> 36.dp
+            else -> 14.dp
+        },
+        label = "islandClearance"
+    )
     Column(
         modifier = Modifier
             .fillMaxSize()
             .statusBarsPadding()
             .navigationBarsPadding()
             .padding(horizontal = if (isCoverScreen) 14.dp else 20.dp)
-            .padding(top = if (isCoverScreen) 8.dp else 14.dp)
+            .padding(top = topExtraPad)
     ) {
         TopOrbBar(
             recState = recState,
@@ -1129,66 +1215,94 @@ private fun HeroRecorderCard(recState: RecorderState, onToggleRecord: () -> Unit
     Surface(
         color = OrbSurface,
         shape = RoundedCornerShape(14.dp),
-        border = BorderStroke(1.dp, if (recState.isRecording) OrbRed.copy(alpha = 0.55f) else OrbBorder),
-        modifier = Modifier.fillMaxWidth()
+        border = BorderStroke(1.dp, if (recState.isRecording) OrbRed.copy(alpha = 0.45f) else OrbBorder),
+        modifier = Modifier
+            .fillMaxWidth()
+            .animateContentSize()
     ) {
-        Column(
-            modifier = Modifier.padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
+        if (recState.isRecording) {
+            // Compact single-row live bar while recording -> frees +100dp for full bilingual dialogue!
             Row(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = when {
-                            recState.isRecording -> "Live · ${VoiceNoteStore.formatTimestamp(recState.elapsedMs)}"
-                            recState.isProcessing -> "Saving & indexing…"
-                            else -> "Audio Notes"
-                        },
-                        style = MaterialTheme.typography.headlineSmall,
-                        color = OrbFgStrong
-                    )
-                    Text(
                         text = recState.statusMessage,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = OrbFgMuted,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = OrbFgStrong,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
+                    Text(
+                        text = "Live · ${VoiceNoteStore.formatTimestamp(recState.elapsedMs)}",
+                        style = MaterialTheme.typography.labelSmall.copy(fontFeatureSettings = "tnum"),
+                        color = OrbFgMuted
+                    )
                 }
-                if (recState.isProcessing) {
-                    CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp, color = OrbAmber)
+                Button(
+                    onClick = onToggleRecord,
+                    enabled = !recState.isProcessing,
+                    shape = RoundedCornerShape(10.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = OrbRed,
+                        contentColor = OrbFgStrong
+                    ),
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 0.dp),
+                    modifier = Modifier.height(36.dp)
+                ) {
+                    Icon(Icons.Rounded.Stop, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(5.dp))
+                    Text("Stop", style = MaterialTheme.typography.labelMedium)
                 }
             }
-
-            AnimatedVisibility(visible = recState.isRecording) {
-                WaveformBarCanvas(levels = recState.levels, modifier = Modifier.fillMaxWidth().height(40.dp))
-            }
-
-            Button(
-                onClick = onToggleRecord,
-                enabled = !recState.isProcessing,
-                shape = RoundedCornerShape(12.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (recState.isRecording) OrbRed else OrbFgStrong,
-                    contentColor = if (recState.isRecording) OrbFgStrong else OrbBg
-                ),
-                contentPadding = PaddingValues(horizontal = 16.dp),
-                modifier = Modifier.fillMaxWidth().height(48.dp)
+        } else {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Icon(
-                    imageVector = if (recState.isRecording) Icons.Rounded.Stop else Icons.Rounded.Mic,
-                    contentDescription = null,
-                    modifier = Modifier.size(18.dp)
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = if (recState.isRecording) "Stop & Save Note" else "Record Audio Note",
-                    style = MaterialTheme.typography.labelLarge
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = if (recState.isProcessing) "Saving & indexing…" else "Audio Notes",
+                            style = MaterialTheme.typography.headlineSmall,
+                            color = OrbFgStrong
+                        )
+                        Text(
+                            text = recState.statusMessage,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = OrbFgMuted,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    if (recState.isProcessing) {
+                        CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp, color = OrbAmber)
+                    }
+                }
+
+                Button(
+                    onClick = onToggleRecord,
+                    enabled = !recState.isProcessing,
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = OrbFgStrong,
+                        contentColor = OrbBg
+                    ),
+                    contentPadding = PaddingValues(horizontal = 16.dp),
+                    modifier = Modifier.fillMaxWidth().height(48.dp)
+                ) {
+                    Icon(Icons.Rounded.Mic, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Record Audio Note", style = MaterialTheme.typography.labelLarge)
+                }
             }
         }
     }
@@ -1236,7 +1350,9 @@ private data class SpeakerTurnGroup(
     val endMs: Long,
     val paragraphs: List<String>,
     val translations: List<String> = emptyList(),
-    val livePartial: String? = null
+    val isTranslating: Boolean = false,
+    val livePartial: String? = null,
+    val livePartialTranslation: String? = null
 )
 
 private fun groupConsecutiveSegments(
@@ -1244,18 +1360,22 @@ private fun groupConsecutiveSegments(
     activeSpeakerIndex: Int? = null,
     activeSpeakerName: String? = null,
     partialText: String = "",
+    partialTranslation: String = "",
     elapsedMs: Long = 0L
 ): List<SpeakerTurnGroup> {
     val groups = mutableListOf<SpeakerTurnGroup>()
     for (seg in segments) {
         val last = groups.lastOrNull()
-        val tr = seg.translatedText.trim()
+        val rawTr = seg.translatedText.trim()
+        val pendingTx = rawTr == "\u200B" || rawTr == "Translating…"
+        val tr = if (pendingTx) "" else rawTr
         if (last != null && last.speakerIndex == seg.speakerIndex) {
             groups[groups.lastIndex] = last.copy(
                 speakerName = seg.speakerName,
                 endMs = maxOf(last.endMs, seg.endMs),
                 paragraphs = last.paragraphs + seg.text,
-                translations = if (tr.isNotEmpty()) last.translations + tr else last.translations
+                translations = if (tr.isNotEmpty()) last.translations + tr else last.translations,
+                isTranslating = last.isTranslating || pendingTx
             )
         } else {
             groups.add(
@@ -1265,7 +1385,8 @@ private fun groupConsecutiveSegments(
                     startMs = seg.startMs,
                     endMs = seg.endMs,
                     paragraphs = listOf(seg.text),
-                    translations = if (tr.isNotEmpty()) listOf(tr) else emptyList()
+                    translations = if (tr.isNotEmpty()) listOf(tr) else emptyList(),
+                    isTranslating = pendingTx
                 )
             )
         }
@@ -1274,10 +1395,12 @@ private fun groupConsecutiveSegments(
         val spkIdx = activeSpeakerIndex ?: groups.lastOrNull()?.speakerIndex ?: 0
         val spkName = activeSpeakerName ?: "Speaker ${spkIdx + 1}"
         val last = groups.lastOrNull()
+        val liveTx = partialTranslation.ifBlank { null }
         if (last != null && last.speakerIndex == spkIdx) {
             groups[groups.lastIndex] = last.copy(
                 endMs = maxOf(last.endMs, elapsedMs),
-                livePartial = partialText
+                livePartial = partialText,
+                livePartialTranslation = liveTx
             )
         } else {
             groups.add(
@@ -1287,7 +1410,8 @@ private fun groupConsecutiveSegments(
                     startMs = elapsedMs,
                     endMs = elapsedMs,
                     paragraphs = emptyList(),
-                    livePartial = partialText
+                    livePartial = partialText,
+                    livePartialTranslation = liveTx
                 )
             )
         }
@@ -1306,22 +1430,24 @@ private fun LiveTranscriptStream(
     val listState = rememberLazyListState()
     val activeIdx = recState.activeSpeakerIndex ?: 0
     val activeName = recState.speakerNames[activeIdx] ?: "Speaker ${activeIdx + 1}"
-    val groups = remember(recState.liveSegments, recState.partialText, recState.activeSpeakerIndex, recState.speakerNames) {
+    val groups = remember(recState.liveSegments, recState.partialText, recState.partialTranslation, recState.activeSpeakerIndex, recState.speakerNames) {
         groupConsecutiveSegments(
             segments = recState.liveSegments,
             activeSpeakerIndex = activeIdx,
             activeSpeakerName = activeName,
             partialText = recState.partialText,
+            partialTranslation = recState.partialTranslation,
             elapsedMs = recState.elapsedMs
         )
     }
 
-    val lastChars = (groups.lastOrNull()?.paragraphs?.sumOf { it.length } ?: 0) + recState.partialText.length
+    val lastChars = (groups.lastOrNull()?.paragraphs?.sumOf { it.length } ?: 0) +
+        (groups.lastOrNull()?.translations?.sumOf { it.length } ?: 0) +
+        recState.partialText.length +
+        recState.partialTranslation.length
     LaunchedEffect(groups.size, recState.liveSegments.size, lastChars) {
         if (groups.isNotEmpty()) {
-            // Scroll to the trailing bottom_anchor item so even a tall multi-sentence speaker card
-            // stays pinned to its latest line at the bottom of the screen.
-            listState.scrollToItem(groups.size)
+            listState.animateScrollToItem(groups.size)
         }
     }
 
@@ -1358,7 +1484,9 @@ private fun LiveTranscriptStream(
                 timestamp = ts,
                 paragraphs = grp.paragraphs,
                 translations = grp.translations,
+                isTranslating = grp.isTranslating,
                 livePartial = grp.livePartial,
+                livePartialTranslation = grp.livePartialTranslation,
                 color = sColor,
                 useSerif = false,
                 onClickSpeaker = { onRenameSpeaker(grp.speakerIndex, grp.speakerName) }
@@ -1376,7 +1504,9 @@ private fun SpeakerGroupCard(
     timestamp: String,
     paragraphs: List<String>,
     translations: List<String> = emptyList(),
+    isTranslating: Boolean = false,
     livePartial: String? = null,
+    livePartialTranslation: String? = null,
     color: androidx.compose.ui.graphics.Color,
     useSerif: Boolean,
     onClickSpeaker: () -> Unit
@@ -1431,26 +1561,48 @@ private fun SpeakerGroupCard(
                         )
                     }
                     Text(text = timestamp, style = MaterialTheme.typography.labelSmall, color = OrbFgSubtle)
+                    if (isTranslating) {
+                        Text(
+                            text = "· translating",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = OrbBlue
+                        )
+                    }
                 }
-                if (paragraphs.isNotEmpty()) {
+                val hasAnyTranslation = translations.isNotEmpty() || !livePartialTranslation.isNullOrBlank()
+                if (paragraphs.isNotEmpty() || !livePartial.isNullOrBlank()) {
+                    val originalLine = buildString {
+                        if (paragraphs.isNotEmpty()) append(paragraphs.joinToString(" "))
+                        if (!livePartial.isNullOrBlank()) {
+                            if (isNotEmpty()) append(' ')
+                            append(livePartial)
+                            append('▍')
+                        }
+                    }
                     Text(
-                        text = paragraphs.joinToString(" "),
-                        style = if (translations.isNotEmpty()) MaterialTheme.typography.bodySmall else bodyStyle,
-                        color = if (translations.isNotEmpty()) OrbFgMuted else OrbFgStrong
+                        text = originalLine,
+                        style = if (hasAnyTranslation) MaterialTheme.typography.bodySmall else bodyStyle,
+                        color = if (hasAnyTranslation) OrbFgMuted else OrbFgStrong
                     )
                 }
-                if (translations.isNotEmpty()) {
-                    Text(
-                        text = "→ ${translations.joinToString(" ")}",
-                        style = bodyStyle,
-                        color = OrbFgStrong
+                if (hasAnyTranslation) {
+                    HorizontalDivider(
+                        color = OrbBorder.copy(alpha = 0.65f),
+                        thickness = 1.dp,
+                        modifier = Modifier.padding(vertical = 2.dp)
                     )
-                }
-                if (!livePartial.isNullOrBlank()) {
+                    val translatedLine = buildString {
+                        if (translations.isNotEmpty()) append(translations.joinToString(" "))
+                        if (!livePartialTranslation.isNullOrBlank()) {
+                            if (isNotEmpty()) append(' ')
+                            append(livePartialTranslation)
+                            append('▍')
+                        }
+                    }
                     Text(
-                        text = "${livePartial}▍",
+                        text = translatedLine,
                         style = bodyStyle,
-                        color = OrbFgMuted
+                        color = if (translations.isEmpty()) OrbBlue else OrbFgStrong
                     )
                 }
             }
@@ -1495,27 +1647,91 @@ private fun StatusChip(text: String, tint: androidx.compose.ui.graphics.Color) {
     }
 }
 
+/**
+ * Murmure-inspired pure-black fluid 60-120 FPS voice waveform capsule.
+ * Reads directly from VoiceRecorderService.copyWaveform() inside Compose's vsync
+ * frame callback (withFrameNanos) with smooth per-bar interpolation and ZERO
+ * screen-level recompositions.
+ */
 @Composable
-private fun WaveformBarCanvas(levels: List<Float>, modifier: Modifier = Modifier) {
-    val barColor = OrbRed
-    val idleColor = OrbBorder
-    Canvas(modifier = modifier) {
-        val barCount = 48
-        val gap = 3.dp.toPx()
-        val barW = ((size.width - gap * (barCount - 1)) / barCount).coerceAtLeast(2f)
-        val midY = size.height / 2f
-        val startOffset = (barCount - levels.size).coerceAtLeast(0)
-        for (i in 0 until barCount) {
-            val lvl = if (i >= startOffset) levels[i - startOffset] else 0.06f
-            val h = (size.height * lvl).coerceAtLeast(3.dp.toPx())
-            val x = i * (barW + gap)
-            drawRoundRect(
-                color = if (i >= startOffset) barColor else idleColor,
-                topLeft = Offset(x, midY - h / 2f),
-                size = Size(barW, h),
-                cornerRadius = CornerRadius(barW / 2f, barW / 2f)
-            )
+private fun MurmureFluidWaveform(
+    barCount: Int = 36,
+    isProcessing: Boolean = false,
+    modifier: Modifier = Modifier
+) {
+    val targetLevels = remember(barCount) { FloatArray(barCount) }
+    val displayLevels = remember(barCount) { FloatArray(barCount) }
+    var frameNanos by remember { mutableLongStateOf(0L) }
+
+    LaunchedEffect(barCount, isProcessing) {
+        while (true) {
+            withFrameNanos { now ->
+                if (!isProcessing) {
+                    VoiceRecorderService.copyWaveform(targetLevels)
+                    for (i in 0 until barCount) {
+                        displayLevels[i] += (targetLevels[i] - displayLevels[i]) * 0.32f
+                    }
+                }
+                frameNanos = now
+            }
         }
+    }
+
+    Canvas(modifier = modifier) {
+        val t = frameNanos * 1e-9
+        val dotPx = 2.dp.toPx()
+        val gap = ((size.width - dotPx * barCount) / (barCount - 1).coerceAtLeast(1)).coerceAtLeast(1.5.dp.toPx())
+        val totalW = barCount * dotPx + (barCount - 1) * gap
+        val startX = ((size.width - totalW) / 2f).coerceAtLeast(0f)
+        val midY = size.height / 2f
+        val maxBarH = (size.height - 2.dp.toPx()).coerceAtLeast(dotPx)
+
+        for (i in 0 until barCount) {
+            val x = startX + i * (dotPx + gap)
+            if (isProcessing) {
+                // Murmure transcribing state: travelling sine-wave white dots
+                val wave = kotlin.math.sin(t * 7.0 - i * 0.35).toFloat().coerceAtLeast(0f)
+                val alpha = 0.22f + 0.78f * wave
+                drawRoundRect(
+                    color = androidx.compose.ui.graphics.Color.White.copy(alpha = alpha),
+                    topLeft = Offset(x, midY - dotPx / 2f),
+                    size = Size(dotPx, dotPx),
+                    cornerRadius = CornerRadius(dotPx / 2f, dotPx / 2f)
+                )
+            } else {
+                val lvl = displayLevels[i].coerceIn(0f, 1f)
+                val h = (dotPx + lvl * (maxBarH - dotPx)).coerceIn(dotPx, maxBarH)
+                val alpha = (0.35f + 0.65f * lvl).coerceIn(0.35f, 1f)
+                drawRoundRect(
+                    color = androidx.compose.ui.graphics.Color.White.copy(alpha = alpha),
+                    topLeft = Offset(x, midY - h / 2f),
+                    size = Size(dotPx, h),
+                    cornerRadius = CornerRadius(dotPx / 2f, dotPx / 2f)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun WaveformBarCanvas(
+    @Suppress("UNUSED_PARAMETER") levels: List<Float>,
+    modifier: Modifier = Modifier,
+    isProcessing: Boolean = false
+) {
+    Surface(
+        shape = RoundedCornerShape(50),
+        color = androidx.compose.ui.graphics.Color(0xFF000000),
+        border = BorderStroke(1.dp, androidx.compose.ui.graphics.Color.White.copy(alpha = 0.16f)),
+        modifier = modifier
+    ) {
+        MurmureFluidWaveform(
+            barCount = 36,
+            isProcessing = isProcessing,
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 16.dp, vertical = 6.dp)
+        )
     }
 }
 
@@ -1744,6 +1960,7 @@ private fun SettingsModalSheet(
     var deepModelDraft by remember { mutableStateOf(orbCfg.deepAudioModel) }
     var livePolishDraft by remember { mutableStateOf(orbCfg.livePolishEnabled) }
     var autoTranslateDraft by remember { mutableStateOf(orbCfg.autoTranslateTarget) }
+    var localAsrDraft by remember { mutableStateOf(orbCfg.localAsrModel) }
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
     ModalBottomSheet(
@@ -1763,10 +1980,58 @@ private fun SettingsModalSheet(
         ) {
             Text("Scribe Settings", style = MaterialTheme.typography.titleMedium, color = OrbFgStrong)
             Text(
-                text = "Hardware: ${npuStatus.badgeLabel} · WeSpeaker ResNet293-LM · Parakeet-TDT-0.6B-v3",
+                text = "Hardware: ${npuStatus.badgeLabel} (ShMem 12ms) · WeSpeaker ResNet293-LM · Warm Pool",
                 style = MaterialTheme.typography.labelSmall,
                 color = if (npuStatus.isReady) OrbGreen else OrbFgMuted
             )
+            Text(
+                text = "LOCAL ASR ENGINE (ON-DEVICE)",
+                fontSize = 11.sp,
+                letterSpacing = 0.8.sp,
+                color = OrbFgSubtle
+            )
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                val rows = listOf(
+                    listOf(
+                        LocalAsrEngine.AsrModel.PARAKEET_NPU.id to "Parakeet 0.6B NPU\n70ms · V79 NPU",
+                        LocalAsrEngine.AsrModel.QWEN3_0_6B.id to "Qwen3 0.6B\n30+ Auto-Lang"
+                    ),
+                    listOf(
+                        LocalAsrEngine.AsrModel.COHERE_2B.id to "Cohere 2B\nFast Live · Noisy",
+                        LocalAsrEngine.AsrModel.QWEN3_1_7B_LORA.id to "Qwen3 1.7B Local\n4.4% WER · IQ4_XS"
+                    )
+                )
+                rows.forEach { pair ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        pair.forEach { (id, label) ->
+                            val selected = localAsrDraft == id
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(if (selected) OrbGreen.copy(alpha = 0.16f) else OrbBg)
+                                    .border(1.dp, if (selected) OrbGreen else OrbBorder, RoundedCornerShape(8.dp))
+                                    .clickable { localAsrDraft = id }
+                                    .padding(vertical = 8.dp, horizontal = 4.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = label,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (selected) OrbGreen else OrbFgMuted,
+                                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                                )
+                            }
+                        }
+                    }
+                }
+            }
             HorizontalDivider(color = OrbBorder)
 
             Text(
@@ -1930,7 +2195,8 @@ private fun SettingsModalSheet(
                             livePolishEnabled = livePolishDraft,
                             autoTranslateTarget = autoTranslateDraft,
                             translateLangA = orbCfg.translateLangA,
-                            translateLangB = orbCfg.translateLangB
+                            translateLangB = orbCfg.translateLangB,
+                            localAsrModel = localAsrDraft
                         )
                     )
                 },
