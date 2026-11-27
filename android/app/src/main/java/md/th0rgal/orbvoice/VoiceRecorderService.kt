@@ -1227,6 +1227,17 @@ class VoiceRecorderService : Service() {
             writeWavFromPcmFile(pcmFile, totalPcmBytes, wavFile)
             pcmFile.delete()
 
+            // 1b. Post-recording ElevenLabs Scribe batch diarization (`diarize=true`) for crisp 3+ speaker separation
+            var resolvedSegments = finalSegments
+            if (elCfg.elevenLabsApiKey.isNotBlank() && durationMs >= 1500L) {
+                _state.value = _state.value.copy(statusMessage = "Diarizing speakers (ElevenLabs)…")
+                val diarized = ElevenLabsScribeClient.diarizeBatch(elCfg.elevenLabsApiKey, wavFile, speakerNames)
+                if (!diarized.isNullOrEmpty()) {
+                    resolvedSegments = diarized
+                }
+            }
+            val resolvedSpeakerCount = resolvedSegments.map { it.speakerIndex }.distinct().size.coerceAtLeast(1)
+
             // 2. Persist .md + .json IMMEDIATELY so stopping ALWAYS guarantees the note is saved!
             var note = VoiceNote(
                 id = noteId,
@@ -1236,10 +1247,10 @@ class VoiceRecorderService : Service() {
                 audioPath = wavFile.absolutePath,
                 markdownPath = File(dir, "$noteId.md").absolutePath,
                 jsonPath = File(dir, "$noteId.json").absolutePath,
-                engineUsed = activeEngineTag,
-                speakerCount = speakerCount,
+                engineUsed = if (elCfg.elevenLabsApiKey.isNotBlank()) "ElevenLabs Scribe (diarized)" else activeEngineTag,
+                speakerCount = resolvedSpeakerCount,
                 syncedToSpark = false,
-                segments = finalSegments
+                segments = resolvedSegments
             )
             VoiceNoteStore.saveNote(this, note)
 

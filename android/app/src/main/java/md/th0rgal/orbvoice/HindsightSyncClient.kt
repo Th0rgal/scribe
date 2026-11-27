@@ -97,7 +97,8 @@ object HindsightSyncClient {
                 readTimeout = 30_000
                 doOutput = true
                 setRequestProperty("Content-Type", "application/json")
-                setRequestProperty("Accept", "application/json")
+                setRequestProperty("Accept", "application/json, text/event-stream")
+                setRequestProperty("User-Agent", "Scribe-Android/1.0")
                 setRequestProperty("Authorization", "Bearer $apiToken")
             }
             OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { it.write(payload.toString()) }

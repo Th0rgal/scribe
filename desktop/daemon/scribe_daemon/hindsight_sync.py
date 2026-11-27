@@ -63,9 +63,22 @@ class HindsightNoteSyncer:
     def _headers(self, token: str) -> dict[str, str]:
         return {
             "Content-Type": "application/json",
-            "Accept": "application/json",
+            "Accept": "application/json, text/event-stream",
             "Authorization": f"Bearer {token}",
+            "User-Agent": "Scribe/0.2.0",
         }
+
+    @staticmethod
+    def _parse_mcp_response(raw: str) -> dict[str, Any]:
+        text = raw.strip()
+        if text.startswith("{"):
+            return json.loads(text)
+        for line in text.splitlines():
+            if line.startswith("data:"):
+                payload = line[len("data:"):].strip()
+                if payload.startswith("{"):
+                    return json.loads(payload)
+        return {"raw": text}
 
     def sync_note(self, rel_path: str, title: str, markdown: str, is_voice: bool = False) -> dict[str, Any]:
         if not markdown.strip():
@@ -115,7 +128,7 @@ class HindsightNoteSyncer:
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=30) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
+            body = self._parse_mcp_response(resp.read().decode("utf-8"))
         return {
             "status": "synced",
             "bank_id": self.bank_id,

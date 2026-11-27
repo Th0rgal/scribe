@@ -2,12 +2,16 @@ package md.th0rgal.orbvoice
 
 import android.util.Base64
 import android.util.Log
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONObject
+import java.io.File
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -33,6 +37,104 @@ class ElevenLabsScribeClient(
                 .readTimeout(0, TimeUnit.MILLISECONDS)
                 .pingInterval(20, TimeUnit.SECONDS)
                 .build()
+        }
+
+        private val batchHttpClient: OkHttpClient by lazy {
+            OkHttpClient.Builder()
+                .connectTimeout(15, TimeUnit.SECONDS)
+                .readTimeout(120, TimeUnit.SECONDS)
+                .writeTimeout(60, TimeUnit.SECONDS)
+                .build()
+        }
+
+        /**
+         * Post-recording batch transcription + multi-speaker diarization using ElevenLabs Scribe (`diarize=true`).
+         * Groups consecutive words by `speaker_id` into clean [TranscriptSegment] turns.
+         */
+        fun diarizeBatch(
+            apiKey: String,
+            audioFile: File,
+            speakerNames: Map<Int, String> = emptyMap()
+        ): List<TranscriptSegment>? {
+            val cleanKey = apiKey.trim()
+            if (cleanKey.isEmpty() || !audioFile.isFile || audioFile.length() < 1000L) return null
+            return try {
+                val body = MultipartBody.Builder()
+                    .setType(MultipartBody.FORM)
+                    .addFormDataPart("model_id", "scribe_v1")
+                    .addFormDataPart("diarize", "true")
+                    .addFormDataPart("timestamps_granularity", "word")
+                    .addFormDataPart(
+                        "file",
+                        audioFile.name,
+                        audioFile.asRequestBody("audio/wav".toMediaType())
+                    )
+                    .build()
+                val req = Request.Builder()
+                    .url("https://api.elevenlabs.io/v1/speech-to-text")
+                    .header("xi-api-key", cleanKey)
+                    .post(body)
+                    .build()
+                batchHttpClient.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) {
+                        Log.w(TAG, "Batch diarize HTTP ${resp.code}: ${resp.message}")
+                        return null
+                    }
+                    val raw = resp.body?.string().orEmpty()
+                    val root = JSONObject(raw)
+                    val words = root.optJSONArray("words") ?: return null
+                    val speakerMap = LinkedHashMap<String, Int>()
+                    val out = ArrayList<TranscriptSegment>()
+                    var curSpkId: String? = null
+                    var curStartMs = 0L
+                    var curEndMs = 0L
+                    val buf = StringBuilder()
+
+                    fun flush() {
+                        val txt = buf.toString().trim()
+                        val spk = curSpkId
+                        if (txt.isNotEmpty() && spk != null) {
+                            val idx = speakerMap.getOrPut(spk) { speakerMap.size }
+                            val label = speakerNames[idx] ?: "Speaker ${idx + 1}"
+                            out.add(
+                                TranscriptSegment(
+                                    speakerIndex = idx,
+                                    speakerName = label,
+                                    startMs = curStartMs,
+                                    endMs = curEndMs,
+                                    text = txt
+                                )
+                            )
+                        }
+                        buf.clear()
+                    }
+
+                    for (i in 0 until words.length()) {
+                        val w = words.optJSONObject(i) ?: continue
+                        val type = w.optString("type", "word")
+                        if (type != "word" && type != "spacing") continue
+                        val text = w.optString("text", "")
+                        val spk = w.optString("speaker_id", "speaker_0").ifBlank { "speaker_0" }
+                        val sMs = (w.optDouble("start", 0.0) * 1000.0).toLong()
+                        val eMs = (w.optDouble("end", 0.0) * 1000.0).toLong()
+                        if (type == "word" && curSpkId != null && curSpkId != spk) {
+                            flush()
+                            curSpkId = spk
+                            curStartMs = sMs
+                        } else if (curSpkId == null && type == "word") {
+                            curSpkId = spk
+                            curStartMs = sMs
+                        }
+                        if (eMs > curEndMs) curEndMs = eMs
+                        buf.append(text)
+                    }
+                    flush()
+                    if (out.isNotEmpty()) out else null
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "Batch diarize failed: ${t.message}")
+                null
+            }
         }
     }
 

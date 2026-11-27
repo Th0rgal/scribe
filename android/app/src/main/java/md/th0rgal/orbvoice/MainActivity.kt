@@ -104,6 +104,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
@@ -1485,29 +1486,20 @@ private fun groupConsecutiveSegments(
         }
     }
     if (partialText.isNotBlank()) {
-        val spkIdx = activeSpeakerIndex ?: groups.lastOrNull()?.speakerIndex ?: 0
-        val spkName = activeSpeakerName ?: "Speaker ${spkIdx + 1}"
-        val last = groups.lastOrNull()
         val liveTx = partialTranslation.ifBlank { null }
-        if (last != null && last.speakerIndex == spkIdx) {
-            groups[groups.lastIndex] = last.copy(
-                endMs = maxOf(last.endMs, elapsedMs),
+        // Always keep the in-progress utterance in its own separate translucent pending bubble
+        // until the turn commits and speaker diarization assigns it to a speaker.
+        groups.add(
+            SpeakerTurnGroup(
+                speakerIndex = -1,
+                speakerName = "Listening…",
+                startMs = elapsedMs,
+                endMs = elapsedMs,
+                paragraphs = emptyList(),
                 livePartial = partialText,
                 livePartialTranslation = liveTx
             )
-        } else {
-            groups.add(
-                SpeakerTurnGroup(
-                    speakerIndex = spkIdx,
-                    speakerName = spkName,
-                    startMs = elapsedMs,
-                    endMs = elapsedMs,
-                    paragraphs = emptyList(),
-                    livePartial = partialText,
-                    livePartialTranslation = liveTx
-                )
-            )
-        }
+        )
     }
     return groups
 }
@@ -1566,24 +1558,27 @@ private fun LiveTranscriptStream(
         contentPadding = PaddingValues(top = 6.dp, bottom = bottomPadding)
     ) {
         items(groups) { grp ->
-            val sColor = speakerColors[grp.speakerIndex % speakerColors.size]
+            val isPending = grp.speakerIndex < 0
+            val sColor = if (isPending) OrbFgSubtle else speakerColors[grp.speakerIndex % speakerColors.size]
             val ts = if (grp.endMs > grp.startMs + 2000L) {
                 "${VoiceNoteStore.formatTimestamp(grp.startMs)} – ${VoiceNoteStore.formatTimestamp(grp.endMs)}"
             } else {
                 VoiceNoteStore.formatTimestamp(grp.startMs)
             }
-            SpeakerGroupCard(
-                speakerName = grp.speakerName,
-                timestamp = ts,
-                paragraphs = grp.paragraphs,
-                translations = grp.translations,
-                isTranslating = grp.isTranslating,
-                livePartial = grp.livePartial,
-                livePartialTranslation = grp.livePartialTranslation,
-                color = sColor,
-                useSerif = false,
-                onClickSpeaker = { onRenameSpeaker(grp.speakerIndex, grp.speakerName) }
-            )
+            Box(modifier = Modifier.alpha(if (isPending) 0.65f else 1f)) {
+                SpeakerGroupCard(
+                    speakerName = grp.speakerName,
+                    timestamp = ts,
+                    paragraphs = grp.paragraphs,
+                    translations = grp.translations,
+                    isTranslating = grp.isTranslating,
+                    livePartial = grp.livePartial,
+                    livePartialTranslation = grp.livePartialTranslation,
+                    color = sColor,
+                    useSerif = false,
+                    onClickSpeaker = { if (!isPending) onRenameSpeaker(grp.speakerIndex, grp.speakerName) }
+                )
+            }
         }
         item(key = "bottom_anchor") {
             Spacer(modifier = Modifier.height(1.dp))
