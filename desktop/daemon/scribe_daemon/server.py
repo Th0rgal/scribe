@@ -12,10 +12,11 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .hindsight_sync import HindsightNoteSyncer
+from .recorder import DesktopRecorder
 from .store import NoteStore
 
 
-def make_handler(store: NoteStore, syncer: HindsightNoteSyncer, ui_dir: Path):
+def make_handler(store: NoteStore, syncer: HindsightNoteSyncer, ui_dir: Path, recorder: DesktopRecorder):
     def _bg_sync(rel_path: str, title: str, markdown: str, is_voice: bool) -> None:
         try:
             res = syncer.sync_note(rel_path, title, markdown, is_voice=is_voice)
@@ -62,6 +63,9 @@ def make_handler(store: NoteStore, syncer: HindsightNoteSyncer, ui_dir: Path):
                 return
             if path == "/api/voiceprints":
                 self._send_json({"voiceprints": store.list_voiceprints()})
+                return
+            if path == "/api/record/status":
+                self._send_json(recorder.status())
                 return
             if path.startswith("/api/audio/"):
                 rel = unquote(path[len("/api/audio/"):])
@@ -174,6 +178,49 @@ def make_handler(store: NoteStore, syncer: HindsightNoteSyncer, ui_dir: Path):
                     self._send_json({"synced": False, "error": str(exc)}, 502)
                 return
 
+            if parsed.path == "/api/record/start":
+                try:
+                    st = recorder.start(
+                        mic=bool(body.get("mic", True)),
+                        system_audio=bool(body.get("system_audio", True)),
+                    )
+                    self._send_json(st)
+                except Exception as exc:
+                    self._send_json({"error": str(exc)}, 400)
+                return
+
+            if parsed.path == "/api/record/stop":
+                try:
+                    slug, wav_path, duration, segments = recorder.stop()
+                    title = f"Recording · {slug.replace('_', ' ')}"
+                    lines = [
+                        "---",
+                        f"title: \"{title}\"",
+                        f"recorded_at: {slug}",
+                        f"duration_secs: {round(duration, 1)}",
+                        "---",
+                        "",
+                        f"# {title}",
+                        "",
+                    ]
+                    if segments:
+                        for seg in segments:
+                            lines.append(f"**{seg['speaker']}**: {seg['text']}")
+                            lines.append("")
+                    else:
+                        lines.append("_Audio recorded. Configure `ELEVENLABS_API_KEY` for automatic transcription & diarization._")
+                    md = "\n".join(lines).strip() + "\n"
+                    note = store.write_note(f"{slug}.md", md)
+                    threading.Thread(
+                        target=_bg_sync,
+                        args=(note["rel_path"], note["title"], note["markdown"], True),
+                        daemon=True,
+                    ).start()
+                    self._send_json(note)
+                except Exception as exc:
+                    self._send_json({"error": str(exc)}, 400)
+                return
+
             if parsed.path == "/api/sync":
                 pull_res = syncer.pull_notes(store)
                 pushed = 0
@@ -236,5 +283,6 @@ def run_server(port: int = 47921) -> None:
     ui_dir = Path(os.environ.get("SCRIBE_UI_DIST") or Path(__file__).resolve().parents[2] / "ui/dist")
     store = NoteStore(notes_dir, state_db)
     syncer = HindsightNoteSyncer()
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), make_handler(store, syncer, ui_dir))
+    recorder = DesktopRecorder(notes_dir)
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), make_handler(store, syncer, ui_dir, recorder))
     httpd.serve_forever()

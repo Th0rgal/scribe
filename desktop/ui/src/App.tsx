@@ -12,17 +12,6 @@ interface NoteMeta {
   synced: boolean;
 }
 
-interface Voiceprint {
-  id: string;
-  name: string;
-  embedding_dim: number;
-  sample_count: number;
-  source: string;
-  notes: string;
-  created_at: number;
-  updated_at: number;
-}
-
 function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
@@ -71,12 +60,18 @@ function detectSpeakers(md: string): string[] {
     let m: RegExpExecArray | null;
     while ((m = pat.exec(md)) !== null) {
       const name = m[1].trim();
-      if (name && !/^(title|date|recorded_at|sync|tags|http|https)$/i.test(name)) {
+      if (name && !/^(title|date|recorded_at|duration_secs|sync|tags|http|https)$/i.test(name)) {
         found.add(name);
       }
     }
   }
   return Array.from(found);
+}
+
+function formatTimer(secs: number): string {
+  const m = Math.floor(secs / 60);
+  const s = Math.floor(secs % 60);
+  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
 }
 
 export function App() {
@@ -91,22 +86,19 @@ export function App() {
   const [mode, setMode] = createSignal<"preview" | "edit">("preview");
   const [theme, setTheme] = createSignal<"dark" | "light">("dark");
 
-  // Voiceprints state
-  const [vpOpen, setVpOpen] = createSignal(false);
-  const [voiceprints, setVoiceprints] = createSignal<Voiceprint[]>([]);
-  const [selectedVpIds, setSelectedVpIds] = createSignal<string[]>([]);
-  const [newVpName, setNewVpName] = createSignal("");
-  const [newVpNotes, setNewVpNotes] = createSignal("");
-  const [mergeTargetName, setMergeTargetName] = createSignal("");
-  const [editingVpId, setEditingVpId] = createSignal<string | null>(null);
-  const [editingVpName, setEditingVpName] = createSignal("");
-  const [vpStatus, setVpStatus] = createSignal<string | null>(null);
+  // Desktop voice recorder (Mic + System Audio / Google Meet)
+  const [recMic, setRecMic] = createSignal(true);
+  const [recSys, setRecSys] = createSignal(true);
+  const [isRecording, setIsRecording] = createSignal(false);
+  const [isTranscribing, setIsTranscribing] = createSignal(false);
+  const [recElapsed, setRecElapsed] = createSignal(0);
 
-  // Quick speaker relabel popover for current recording
+  // Quick speaker relabel for current recording
   const [relabelSource, setRelabelSource] = createSignal<string | null>(null);
   const [relabelTarget, setRelabelTarget] = createSignal("");
 
   let saveTimer: number | undefined;
+  let recTimer: number | undefined;
   let searchInputRef: HTMLInputElement | undefined;
   let editorRef: HTMLTextAreaElement | undefined;
 
@@ -191,7 +183,7 @@ export function App() {
   }
 
   async function triggerSync() {
-    setSyncText("↻ Two-way syncing thomas/scribe...");
+    setSyncText("↻ Syncing thomas/scribe...");
     const res = await fetch("/api/sync", { method: "POST", body: "{}" });
     if (res.ok) {
       const d = await res.json();
@@ -200,112 +192,63 @@ export function App() {
     }
   }
 
-  async function deleteCurrent() {
-    const p = currentPath();
-    if (!p) return;
-    await fetch(`/api/note?path=${encodeURIComponent(p)}`, { method: "DELETE" });
-    setCurrentPath(null);
-    setCurrentIsVoice(false);
-    setMarkdown("");
-    setAudioPath(null);
-    fetchNotes();
-  }
-
-  // ---- Voiceprints API ----
-  async function fetchVoiceprints() {
-    try {
-      const res = await fetch("/api/voiceprints");
-      if (!res.ok) return;
-      const data = await res.json();
-      setVoiceprints(data.voiceprints || []);
-    } catch {
-      // ignore
+  async function deleteNoteByPath(relPath: string) {
+    await fetch(`/api/note?path=${encodeURIComponent(relPath)}`, { method: "DELETE" });
+    if (currentPath() === relPath) {
+      setCurrentPath(null);
+      setCurrentIsVoice(false);
+      setMarkdown("");
+      setAudioPath(null);
     }
+    await fetchNotes();
   }
 
-  async function addVoiceprint(nameOverride?: string, source = "desktop") {
-    const name = (nameOverride ?? newVpName()).trim();
-    if (!name) return;
-    const res = await fetch("/api/voiceprints", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, notes: newVpNotes().trim(), source }),
-    });
-    if (res.ok) {
-      if (!nameOverride) {
-        setNewVpName("");
-        setNewVpNotes("");
+  async function toggleRecording() {
+    if (isTranscribing()) return;
+    if (!isRecording()) {
+      if (!recMic() && !recSys()) return;
+      const res = await fetch("/api/record/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mic: recMic(), system_audio: recSys() }),
+      });
+      if (res.ok) {
+        setIsRecording(true);
+        setRecElapsed(0);
+        clearInterval(recTimer);
+        recTimer = window.setInterval(() => setRecElapsed((s) => s + 1), 1000);
       }
-      setVpStatus(`Saved voiceprint "${name}"`);
-      await fetchVoiceprints();
+    } else {
+      clearInterval(recTimer);
+      setIsRecording(false);
+      setIsTranscribing(true);
+      setSyncText("↻ Transcribing & diarizing...");
+      try {
+        const res = await fetch("/api/record/stop", { method: "POST", body: "{}" });
+        if (res.ok) {
+          const note = await res.json();
+          await fetchNotes();
+          await openNote(note.rel_path);
+          setMode("preview");
+          setSyncText("● Recording saved & synced");
+        }
+      } finally {
+        setIsTranscribing(false);
+      }
     }
   }
 
-  async function renameVoiceprint(vpId: string) {
-    const name = editingVpName().trim();
-    if (!name) return;
-    const res = await fetch("/api/voiceprints", {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id: vpId, name, relabel_notes: true }),
-    });
-    if (res.ok) {
-      const data = await res.json();
-      setEditingVpId(null);
-      setVpStatus(`Renamed to "${name}" (${data.relabeled_notes || 0} transcripts updated)`);
-      await fetchVoiceprints();
-      const cur = currentPath();
-      if (cur) await openNote(cur);
-    }
-  }
-
-  async function mergeSelectedVoiceprints() {
-    const ids = selectedVpIds();
-    const target = mergeTargetName().trim();
-    if (ids.length < 2 || !target) return;
-    const res = await fetch("/api/voiceprints/merge", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ids, target_name: target, relabel_notes: true }),
-    });
-    if (res.ok) {
-      const data = await res.json();
-      setSelectedVpIds([]);
-      setMergeTargetName("");
-      setVpStatus(`Merged ${data.merged_count} voiceprints into "${data.name}" (${data.relabeled_notes || 0} transcripts updated)`);
-      await fetchVoiceprints();
-      const cur = currentPath();
-      if (cur) await openNote(cur);
-    }
-  }
-
-  async function deleteVoiceprint(vpId: string) {
-    await fetch(`/api/voiceprints?id=${encodeURIComponent(vpId)}`, { method: "DELETE" });
-    setSelectedVpIds((prev) => prev.filter((id) => id !== vpId));
-    await fetchVoiceprints();
-  }
-
-  function toggleVpSelection(vpId: string) {
-    setSelectedVpIds((prev) =>
-      prev.includes(vpId) ? prev.filter((id) => id !== vpId) : [...prev, vpId]
-    );
-  }
-
-  async function applySpeakerLabel(applyAll: boolean) {
+  async function applySpeakerLabel() {
     const fromLabel = relabelSource();
     const toLabel = relabelTarget().trim();
     if (!fromLabel || !toLabel) return;
-    // Save voiceprint if not already in registry
-    if (!voiceprints().some((v) => v.name.toLowerCase() === toLabel.toLowerCase())) {
-      await addVoiceprint(toLabel, "recording");
-    }
     const res = await fetch("/api/voiceprints/apply", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         from_label: fromLabel,
         to_label: toLabel,
-        rel_path: applyAll ? null : currentPath(),
+        rel_path: currentPath(),
       }),
     });
     if (res.ok) {
@@ -338,15 +281,15 @@ export function App() {
       } else if (mod && e.key.toLowerCase() === "n") {
         e.preventDefault();
         createNote();
-      } else if (e.key === "Escape" && vpOpen()) {
-        setVpOpen(false);
       }
     };
     window.addEventListener("keydown", onKeyDown);
-    onCleanup(() => window.removeEventListener("keydown", onKeyDown));
+    onCleanup(() => {
+      window.removeEventListener("keydown", onKeyDown);
+      clearInterval(recTimer);
+    });
 
     fetchNotes();
-    fetchVoiceprints();
   });
 
   return (
@@ -356,17 +299,6 @@ export function App() {
           <span class="rail-title">Scribe</span>
           <div class="rail-actions">
             <button class="icon-btn" onClick={createNote} title="New Note (⌘N)">+</button>
-            <button
-              class={"icon-btn" + (vpOpen() ? " active" : "")}
-              onClick={() => {
-                const next = !vpOpen();
-                setVpOpen(next);
-                if (next) fetchVoiceprints();
-              }}
-              title="Voiceprints & Speakers"
-            >
-              🎙
-            </button>
             <button class="icon-btn" onClick={triggerSync} title="Two-Way Sync">↻</button>
             <button class="icon-btn" onClick={() => setTheme(theme() === "dark" ? "light" : "dark")} title="Toggle Theme">◐</button>
           </div>
@@ -399,6 +331,16 @@ export function App() {
                 class={"note-item" + (n.rel_path === currentPath() ? " active" : "")}
                 onClick={() => openNote(n.rel_path)}
               >
+                <button
+                  class="note-del-btn"
+                  title="Delete note"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    deleteNoteByPath(n.rel_path);
+                  }}
+                >
+                  ✕
+                </button>
                 <div class="note-item-title">{n.title}</div>
                 <div class="note-item-preview">{n.preview || "Empty note"}</div>
                 <div class="note-item-meta">
@@ -411,6 +353,39 @@ export function App() {
             )}
           </For>
         </div>
+
+        <div class="rec-bar">
+          <div class="rec-toggles">
+            <button
+              class={"rec-toggle" + (recMic() ? " on" : "")}
+              disabled={isRecording()}
+              onClick={() => setRecMic(!recMic())}
+              title="Toggle microphone capture"
+            >
+              {recMic() ? "🎙 Mic: On" : "🎙 Mic: Off"}
+            </button>
+            <button
+              class={"rec-toggle" + (recSys() ? " on" : "")}
+              disabled={isRecording()}
+              onClick={() => setRecSys(!recSys())}
+              title="Toggle PC / Google Meet audio capture"
+            >
+              {recSys() ? "🔊 PC Audio: On" : "🔊 PC Audio: Off"}
+            </button>
+          </div>
+          <button
+            class={"rec-btn" + (isRecording() ? " recording" : "")}
+            disabled={isTranscribing() || (!recMic() && !recSys())}
+            onClick={toggleRecording}
+          >
+            {isTranscribing()
+              ? "↻ Diarizing..."
+              : isRecording()
+                ? `■ Stop (${formatTimer(recElapsed())})`
+                : "● Record Audio"}
+          </button>
+        </div>
+
         <div class="sync-footer">{syncText()}</div>
       </aside>
 
@@ -426,7 +401,13 @@ export function App() {
               {mode() === "preview" ? "Edit" : "Preview"}
               <kbd class="kbd-hint">⌘/</kbd>
             </button>
-            <button class="icon-btn danger" onClick={deleteCurrent} title="Delete Note">✕</button>
+            <Show when={currentPath()}>
+              {(p) => (
+                <button class="icon-btn danger" onClick={() => deleteNoteByPath(p())} title="Delete Note">
+                  Delete
+                </button>
+              )}
+            </Show>
           </div>
         </header>
 
@@ -434,15 +415,6 @@ export function App() {
           <div class="recording-card">
             <div class="recording-top">
               <span class="voice-badge">🎙 Recording & Derived STT</span>
-              <button
-                class="vp-trigger-btn"
-                onClick={() => {
-                  fetchVoiceprints();
-                  setVpOpen(true);
-                }}
-              >
-                Manage Voiceprints ({voiceprints().length})
-              </button>
             </div>
             <Show when={audioPath()}>
               {(ap) => <audio controls src={`/api/audio/${encodeURIComponent(ap())}`} />}
@@ -458,7 +430,7 @@ export function App() {
                         setRelabelSource(spk);
                         setRelabelTarget(spk);
                       }}
-                      title="Click to label or assign voiceprint"
+                      title="Click to rename speaker in this recording"
                     >
                       {spk}
                     </button>
@@ -469,19 +441,15 @@ export function App() {
             <Show when={relabelSource()}>
               {(src) => (
                 <div class="relabel-bar">
-                  <span>Label <strong>{src()}</strong> as:</span>
+                  <span>Rename <strong>{src()}</strong> to:</span>
                   <input
                     type="text"
-                    list="vp-suggestions"
                     value={relabelTarget()}
                     onInput={(e) => setRelabelTarget(e.currentTarget.value)}
+                    onKeyDown={(e) => e.key === "Enter" && applySpeakerLabel()}
                     placeholder="Speaker name..."
                   />
-                  <datalist id="vp-suggestions">
-                    <For each={voiceprints()}>{(vp) => <option value={vp.name} />}</For>
-                  </datalist>
-                  <button class="icon-btn" onClick={() => applySpeakerLabel(false)}>This recording</button>
-                  <button class="icon-btn primary" onClick={() => applySpeakerLabel(true)}>All recordings</button>
+                  <button class="icon-btn primary" onClick={applySpeakerLabel}>Apply</button>
                   <button class="icon-btn" onClick={() => setRelabelSource(null)}>Cancel</button>
                 </div>
               )}
@@ -505,118 +473,6 @@ export function App() {
           <article class="preview" innerHTML={previewHtml()} />
         </section>
       </main>
-
-      <Show when={vpOpen()}>
-        <div class="vp-backdrop" onClick={() => setVpOpen(false)}>
-          <div class="vp-modal" onClick={(e) => e.stopPropagation()}>
-            <div class="vp-header">
-              <div>
-                <div class="vp-title">Voiceprints</div>
-                <div class="vp-subtitle">Save, label, and merge speaker voiceprints for automatic labeling</div>
-              </div>
-              <button class="icon-btn" onClick={() => setVpOpen(false)}>✕</button>
-            </div>
-
-            <div class="vp-add-row">
-              <input
-                type="text"
-                placeholder="New speaker name (e.g. Thomas)..."
-                value={newVpName()}
-                onInput={(e) => setNewVpName(e.currentTarget.value)}
-                onKeyDown={(e) => e.key === "Enter" && addVoiceprint()}
-              />
-              <input
-                type="text"
-                placeholder="Optional note..."
-                value={newVpNotes()}
-                onInput={(e) => setNewVpNotes(e.currentTarget.value)}
-                onKeyDown={(e) => e.key === "Enter" && addVoiceprint()}
-              />
-              <button class="icon-btn primary" onClick={() => addVoiceprint()}>Save</button>
-            </div>
-
-            <Show when={selectedVpIds().length >= 2}>
-              <div class="vp-merge-bar">
-                <span>Merge {selectedVpIds().length} selected into:</span>
-                <input
-                  type="text"
-                  placeholder="Target speaker name..."
-                  value={mergeTargetName()}
-                  onInput={(e) => setMergeTargetName(e.currentTarget.value)}
-                  onKeyDown={(e) => e.key === "Enter" && mergeSelectedVoiceprints()}
-                />
-                <button class="icon-btn primary" onClick={mergeSelectedVoiceprints}>
-                  Merge ({selectedVpIds().length})
-                </button>
-              </div>
-            </Show>
-
-            <Show when={vpStatus()}>
-              {(msg) => <div class="vp-status">{msg()}</div>}
-            </Show>
-
-            <div class="vp-list">
-              <Show
-                when={voiceprints().length > 0}
-                fallback={<div class="vp-empty">No voiceprints saved yet. Add one above or click a speaker in any recording.</div>}
-              >
-                <For each={voiceprints()}>
-                  {(vp) => (
-                    <div class="vp-item">
-                      <input
-                        type="checkbox"
-                        checked={selectedVpIds().includes(vp.id)}
-                        onChange={() => toggleVpSelection(vp.id)}
-                      />
-                      <div class="vp-item-info">
-                        <Show
-                          when={editingVpId() === vp.id}
-                          fallback={
-                            <div class="vp-item-name">
-                              {vp.name}
-                              <span class="vp-item-meta">
-                                {vp.sample_count} sample{vp.sample_count === 1 ? "" : "s"}
-                                {vp.embedding_dim > 0 ? ` · ${vp.embedding_dim}D` : ""}
-                                {vp.source ? ` · ${vp.source}` : ""}
-                              </span>
-                            </div>
-                          }
-                        >
-                          <div class="vp-rename-row">
-                            <input
-                              type="text"
-                              value={editingVpName()}
-                              onInput={(e) => setEditingVpName(e.currentTarget.value)}
-                              onKeyDown={(e) => e.key === "Enter" && renameVoiceprint(vp.id)}
-                            />
-                            <button class="icon-btn primary" onClick={() => renameVoiceprint(vp.id)}>Save</button>
-                            <button class="icon-btn" onClick={() => setEditingVpId(null)}>Cancel</button>
-                          </div>
-                        </Show>
-                        <Show when={vp.notes}>
-                          <div class="vp-item-notes">{vp.notes}</div>
-                        </Show>
-                      </div>
-                      <div class="vp-item-actions">
-                        <button
-                          class="icon-btn"
-                          onClick={() => {
-                            setEditingVpId(vp.id);
-                            setEditingVpName(vp.name);
-                          }}
-                        >
-                          Label
-                        </button>
-                        <button class="icon-btn danger" onClick={() => deleteVoiceprint(vp.id)}>✕</button>
-                      </div>
-                    </div>
-                  )}
-                </For>
-              </Show>
-            </div>
-          </div>
-        </div>
-      </Show>
     </div>
   );
 }
