@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Scribe
+Comment=Markdown, LaTeX, and Voice Notes synced to Hindsight
+Exec=scribe %U
+Icon=scribe
+Terminal=false
+Type=Application
+Categories=Office;Utility;TextEditor;
+StartupWMClass=scribe
+MimeType=text/markdown;text/plain;

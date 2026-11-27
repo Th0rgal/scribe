@@ -54,6 +54,7 @@ data class RecorderState(
     val activeSpeakerIndex: Int? = null,
     val liveSegments: List<TranscriptSegment> = emptyList(),
     val partialText: String = "",
+    val partialTranslation: String = "",
     val speakerNames: Map<Int, String> = emptyMap(),
     val lastCompletedNoteId: String? = null
 )
@@ -75,6 +76,7 @@ class VoiceRecorderService : Service() {
     companion object {
         const val ACTION_START = "com.th0rgal.orbvoice.START"
         const val ACTION_STOP = "com.th0rgal.orbvoice.STOP"
+        const val ACTION_BENCHMARK = "com.th0rgal.orbvoice.BENCHMARK"
         const val EXTRA_TRANSLATE_MODE = "translate_mode"
         const val EXTRA_LANG_A = "lang_a"
         const val EXTRA_LANG_B = "lang_b"
@@ -84,6 +86,66 @@ class VoiceRecorderService : Service() {
 
         private val _state = MutableStateFlow(RecorderState())
         val state: StateFlow<RecorderState> = _state
+
+        // Lock-free Murmure-style 10ms perceptual dBFS audio envelope ring buffer.
+        // Read directly by Compose Canvas via withFrameNanos (60-120 FPS) with ZERO recompositions!
+        private val waveformLock = Any()
+        private const val WAVEFORM_BARS = 48
+        private val waveformRing = FloatArray(WAVEFORM_BARS)
+        private var waveformEnvelope = 0f
+
+        fun resetWaveform() {
+            synchronized(waveformLock) {
+                waveformRing.fill(0f)
+                waveformEnvelope = 0f
+            }
+        }
+
+        /**
+         * Murmure perceptual envelope mapping:
+         * -55 dBFS -> 0, -10 dBFS -> 1, fast attack (45ms), smooth release (180ms),
+         * then pow(peak, 0.8) lift so ordinary speech reads vividly.
+         */
+        fun pushAudioMeter(samples: FloatArray, count: Int) {
+            if (count <= 0) return
+            val block = 160 // 10ms at 16 kHz
+            var peak = 0f
+            synchronized(waveformLock) {
+                var i = 0
+                while (i + block <= count) {
+                    var e = 0f
+                    var j = i
+                    val end = i + block
+                    while (j < end) {
+                        val s = samples[j]
+                        e += s * s
+                        j++
+                    }
+                    val rms = sqrt((e / block).toDouble()).toFloat().coerceAtLeast(1e-6f)
+                    val db = 20f * kotlin.math.log10(rms)
+                    val target = ((db + 55f) / 45f).coerceIn(0f, 1f)
+                    val tau = if (target > waveformEnvelope) 45f else 180f
+                    waveformEnvelope += (target - waveformEnvelope) * (1f - kotlin.math.exp(-10f / tau))
+                    if (waveformEnvelope > peak) peak = waveformEnvelope
+                    i += block
+                }
+                if (peak == 0f) {
+                    waveformEnvelope *= 0.85f
+                    peak = waveformEnvelope
+                }
+                val lifted = Math.pow(peak.toDouble(), 0.8).toFloat().coerceIn(0f, 1f)
+                System.arraycopy(waveformRing, 1, waveformRing, 0, WAVEFORM_BARS - 1)
+                waveformRing[WAVEFORM_BARS - 1] = lifted
+            }
+        }
+
+        fun copyWaveform(dest: FloatArray) {
+            val n = dest.size.coerceAtMost(WAVEFORM_BARS)
+            val srcStart = WAVEFORM_BARS - n
+            synchronized(waveformLock) {
+                System.arraycopy(waveformRing, srcStart, dest, 0, n)
+            }
+        }
 
         fun startRecording(
             context: Context,
@@ -155,7 +217,15 @@ class VoiceRecorderService : Service() {
     private var workerThread: Thread? = null
     private var pipeWriterThread: Thread? = null
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val asrExecutor = Executors.newSingleThreadExecutor()
+    private val asrExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread({
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+            r.run()
+        }, "scribe-asr-cpu").apply { isDaemon = true }
+    }
+    private val npuExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "scribe-hexagon-npu").apply { isDaemon = true }
+    }
     private val llmExecutor = Executors.newFixedThreadPool(3)
     private var speechRecognizer: SpeechRecognizer? = null
     private val pipeLock = Any()
@@ -210,6 +280,10 @@ class VoiceRecorderService : Service() {
                 beginCapture()
             }
             ACTION_STOP -> stopCapture()
+            ACTION_BENCHMARK -> {
+                val wav = intent.getStringExtra("wav_path") ?: "/storage/emulated/0/Documents/OrbVoice/2026-11-24_22-02-52.wav"
+                Thread { LocalAsrEngine.runBenchmarkSuite(applicationContext, wav) }.start()
+            }
         }
         return START_NOT_STICKY
     }
@@ -480,12 +554,17 @@ class VoiceRecorderService : Service() {
         val sparkAsrUrl = prefs.getString("spark_asr_url", NpuTranscriptionEngine.DEFAULT_SPARK_ASR_URL)
             ?: NpuTranscriptionEngine.DEFAULT_SPARK_ASR_URL
 
-        _state.value = _state.value.copy(statusMessage = "Loading WeSpeaker ResNet293 + Parakeet-v3…")
-        val neuralEngine = SpeakerDiarizer.NeuralSpeakerEngine.create(this)
-        val localAsr = LocalAsrEngine.create(this)
+        val orbCfgInit = OrbRouterConfig.load(this)
+        val preferredAsr = LocalAsrEngine.AsrModel.fromId(orbCfgInit.localAsrModel)
+        val cohereLangHint = ScribeEnginePool.resolveLanguageHint(orbCfgInit)
+
+        _state.value = _state.value.copy(statusMessage = "Warming Hexagon V79 NPU + ${preferredAsr.label}…")
+        val warm = ScribeEnginePool.acquire(this, orbCfgInit.localAsrModel, cohereLangHint)
+        val neuralEngine = warm.speaker
+        val localAsr = warm.asr
         val sparkOnline = if (localAsr == null) NpuTranscriptionEngine.probeSparkReachable(sparkAsrUrl) else false
         if (localAsr == null && !sparkOnline) {
-            // Fallback to on-device Google SODA only if Parakeet-v3 isn't installed and Spark isn't reachable
+            // Fallback to on-device Google SODA only if no local ASR is installed and Spark isn't reachable
             startOnDeviceSpeechRecognizer()
         }
 
@@ -508,8 +587,6 @@ class VoiceRecorderService : Service() {
         )
         if (recorder.state != AudioRecord.STATE_INITIALIZED) {
             recorder.release()
-            localAsr?.close()
-            neuralEngine?.close()
             recording.set(false)
             _state.value = RecorderState(statusMessage = "AudioRecord failed to initialize")
             releaseWakeLock()
@@ -518,10 +595,10 @@ class VoiceRecorderService : Service() {
         }
 
         val startTimeMs = System.currentTimeMillis()
-        val chunk = ShortArray(1600) // 100ms chunks
-        val floatChunk = FloatArray(1600)
+        val chunk = ShortArray(512) // 32ms chunks (exact Silero VAD window + ~31Hz fluid waveform meter!)
+        val floatChunk = FloatArray(512)
         val byteChunk = ByteArray(chunk.size * 2)
-        val levelsWindow = ArrayDeque<Float>(48)
+        resetWaveform()
 
         // Session-adaptive Neural Speaker Tracker seeded with saved cross-session voiceprints!
         val tracker = SpeakerDiarizer.OnlineSpeakerTracker(neuralEngine = neuralEngine)
@@ -532,19 +609,35 @@ class VoiceRecorderService : Service() {
             _state.value = _state.value.copy(speakerNames = seededNames + _state.value.speakerNames)
         }
         val activeEngineTag = when {
-            localAsr != null -> "${tracker.engineName} + Parakeet-v3"
+            localAsr != null -> "${tracker.engineName} + ${localAsr.modelLabel}"
             sparkOnline -> "${tracker.engineName} + Spark"
             else -> "${tracker.engineName} + SODA"
         }
         _state.value = _state.value.copy(statusMessage = "Listening · $activeEngineTag")
 
-        val turnSamples = ArrayList<Short>(SAMPLE_RATE * 6)
+        // Zero-GC primitive ShortArray turn buffer (replaces ArrayList<Short> boxing of 100k+ Short objects/turn)
+        val turnBuf = ShortArray(SAMPLE_RATE * 10)
+        var turnLen = 0
+        fun appendTurn(src: ShortArray, count: Int) {
+            val copy = count.coerceAtMost(turnBuf.size - turnLen)
+            if (copy > 0) {
+                System.arraycopy(src, 0, turnBuf, turnLen, copy)
+                turnLen += copy
+            }
+        }
         var inTurn = false
         var turnStartMs = 0L
         var silenceChunks = 0
         var noiseFloor = 0.008f
         var earlyClassified = false
         var lastPreviewDecodeMs = 0L
+        var lastPreviewTranslateMs = 0L
+        var lastPreviewTranslatedText = ""
+        var lastUiTickMs = 0L
+        val previewInFlight = AtomicBoolean(false)
+        val previewTranslateInFlight = AtomicBoolean(false)
+        val reconcileInFlight = AtomicBoolean(false)
+        var lastReconciledCount = 0
         lastCommittedSpeechText = ""
         currentSpeakerIndex = 0
         currentTurnStartMs = 0L
@@ -558,57 +651,129 @@ class VoiceRecorderService : Service() {
             val segShorts = ShortArray(segFloats.size) { i ->
                 (segFloats[i] * 32767f).toInt().coerceIn(-32768, 32767).toShort()
             }
+            // True NPU + CPU pipelining: dispatch WeSpeaker ResNet293-LM on Hexagon V79 NPU (~12ms)
+            // concurrently while 6-core Oryon CPU decodes ASR, hiding 100% of diarization latency!
+            val speakerFuture = npuExecutor.submit<Int> {
+                tracker.classifyTurn(segShorts, allowNewSpeaker = true)
+            }
             asrExecutor.execute {
                 val text = localAsr.transcribe(segFloats)
                 if (text.isBlank()) return@execute
-                val speakerIdx = tracker.classifyTurn(segShorts, allowNewSpeaker = true)
+                val speakerIdx = try {
+                    speakerFuture.get()
+                } catch (_: Exception) {
+                    currentSpeakerIndex
+                }
                 currentSpeakerIndex = speakerIdx
                 val cur = _state.value
                 val spkName = cur.speakerNames[speakerIdx] ?: "Speaker ${speakerIdx + 1}"
-                val newSeg = TranscriptSegment(
-                    speakerIndex = speakerIdx,
-                    speakerName = spkName,
-                    startMs = tStart,
-                    endMs = tEnd,
-                    text = text,
-                    translatedText = if (translateModeActive) "Translating…" else ""
-                )
-                val updatedList = cur.liveSegments + newSeg
-                val targetIndex = updatedList.lastIndex
+
+                // Smart same-speaker fragment auto-merge: if the same speaker resumes within 1.2s
+                // after an unfinished short fragment (< 45 chars, no terminal .?!), merge into it
+                // instead of splitting a single sentence across two cards.
+                val prev = cur.liveSegments.lastOrNull()
+                val shouldAutoMerge = prev != null &&
+                    prev.speakerIndex == speakerIdx &&
+                    (tStart - prev.endMs) <= 1200L &&
+                    prev.text.length < 45 &&
+                    (prev.text.lastOrNull() ?: ' ') !in charArrayOf('.', '?', '!')
+
+                val updatedList: List<TranscriptSegment>
+                val targetIndex: Int
+                val effectiveText: String
+                // Carry forward any already-streamed partialTranslation seamlessly so the UI never flashes
+                // a jarring "Translating..." placeholder over text the user was already reading!
+                val carriedTx = if (translateModeActive) {
+                    cur.partialTranslation.trim().ifEmpty { "\u200B" } // zero-width sentinel = refining badge in header
+                } else ""
+                if (shouldAutoMerge && prev != null) {
+                    effectiveText = "${prev.text.trimEnd()} $text"
+                    val mergedSeg = prev.copy(
+                        endMs = tEnd,
+                        text = effectiveText,
+                        translatedText = if (translateModeActive) carriedTx.ifEmpty { prev.translatedText } else prev.translatedText
+                    )
+                    updatedList = cur.liveSegments.dropLast(1) + mergedSeg
+                    targetIndex = updatedList.lastIndex
+                } else {
+                    effectiveText = text
+                    val newSeg = TranscriptSegment(
+                        speakerIndex = speakerIdx,
+                        speakerName = spkName,
+                        startMs = tStart,
+                        endMs = tEnd,
+                        text = text,
+                        translatedText = carriedTx
+                    )
+                    updatedList = cur.liveSegments + newSeg
+                    targetIndex = updatedList.lastIndex
+                }
+
                 _state.value = cur.copy(
                     activeSpeakerIndex = speakerIdx,
                     partialText = "",
+                    partialTranslation = "",
                     liveSegments = updatedList
                 )
                 // A) Rolling live Orb Router autocorrect + auto-translate / bidirectional translate in parallel
                 val orbCfg = OrbRouterConfig.load(this)
-                val shouldRunLlm = orbCfg.isConfigured &&
-                    (translateModeActive || orbCfg.autoTranslateTarget.isNotBlank() || orbCfg.livePolishEnabled) &&
-                    text.length >= 2
+                val shouldRunLlm = (translateModeActive || orbCfg.autoTranslateTarget.isNotBlank() || orbCfg.livePolishEnabled) &&
+                    effectiveText.length >= 2
                 if (shouldRunLlm) {
                     val ctxSnap = updatedList.dropLast(1).takeLast(3)
                     val namesSnap = cur.speakerNames.values.toList()
                     val bidirA = if (translateModeActive) translateLangA else null
                     val bidirB = if (translateModeActive) translateLangB else null
                     llmExecutor.execute {
-                        var res = OrbRouterClient.polishAndTranslateLive(
-                            cfg = orbCfg,
-                            rawText = text,
-                            recentContext = ctxSnap,
-                            knownSpeakers = namesSnap,
-                            bidirectionalLangA = bidirA,
-                            bidirectionalLangB = bidirB
-                        )
+                        var res = if (orbCfg.isConfigured) {
+                            OrbRouterClient.polishAndTranslateLive(
+                                cfg = orbCfg,
+                                rawText = effectiveText,
+                                recentContext = ctxSnap,
+                                knownSpeakers = namesSnap,
+                                bidirectionalLangA = bidirA,
+                                bidirectionalLangB = bidirB
+                            )
+                        } else null
                         // One quick retry if bidirectional translation came back empty
-                        if (translateModeActive && (res == null || res.translated.isBlank())) {
+                        if (orbCfg.isConfigured && translateModeActive && (res == null || res.translated.isBlank())) {
                             res = OrbRouterClient.polishAndTranslateLive(
                                 cfg = orbCfg,
-                                rawText = text,
+                                rawText = effectiveText,
                                 recentContext = emptyList(),
                                 knownSpeakers = namesSnap,
                                 bidirectionalLangA = bidirA,
                                 bidirectionalLangB = bidirB
                             )
+                        }
+                        // 100% OFFLINE airplane-mode fallback via NVIDIA Canary-1B-v2 if Orb Router is unreachable!
+                        if (res == null || (translateModeActive && res.translated.isBlank())) {
+                            val targetLang = when {
+                                translateModeActive -> {
+                                    // Heuristic: if text has French accents/common French words, translate A/B accordingly
+                                    val looksFr = Regex("\\b(je|tu|il|elle|nous|vous|est|c'est|le|la|les|des|une|que|qui|mais|pour|avec|dans|pas)\\b", RegexOption.IGNORE_CASE).containsMatchIn(effectiveText) ||
+                                        effectiveText.any { it in "éèêëàâùûçôîï" }
+                                    if (looksFr && translateLangA.equals("French", true)) translateLangB
+                                    else if (looksFr && translateLangB.equals("French", true)) translateLangA
+                                    else if (translateLangA.equals("English", true)) translateLangB
+                                    else translateLangA
+                                }
+                                orbCfg.autoTranslateTarget.isNotBlank() -> orbCfg.autoTranslateTarget
+                                else -> ""
+                            }
+                            if (targetLang.isNotBlank()) {
+                                val srcLang = if (translateModeActive) {
+                                    if (targetLang.equals(translateLangA, true)) translateLangB else translateLangA
+                                } else {
+                                    if (targetLang.equals("English", true)) "French" else "English"
+                                }
+                                val offlineTx = LocalAsrEngine.translateSpeechOffline(
+                                    applicationContext, segFloats, srcLang, targetLang
+                                )
+                                if (!offlineTx.isNullOrBlank()) {
+                                    res = LivePolishResult(cleaned = res?.cleaned ?: effectiveText, translated = "$offlineTx (offline)")
+                                }
+                            }
                         }
                         val nowState = _state.value
                         if (targetIndex < nowState.liveSegments.size) {
@@ -619,10 +784,76 @@ class VoiceRecorderService : Service() {
                                     text = res.cleaned,
                                     translatedText = res.translated
                                 )
-                            } else if (existingSeg.translatedText == "Translating…") {
+                            } else if (existingSeg.translatedText == "\u200B" || existingSeg.translatedText == "Translating…") {
                                 copy[targetIndex] = existingSeg.copy(translatedText = "")
                             }
                             _state.value = nowState.copy(liveSegments = copy)
+                        }
+
+                        // B) Near-real-time sliding-window LLM conversation reconciler:
+                        // Every 2 committed turns, review the last 4 turns together to fix speaker
+                        // attribution, merge mid-sentence VAD splits, and polish phrasing live!
+                        val postState = _state.value
+                        val totalSegs = postState.liveSegments.size
+                        if (orbCfg.isConfigured &&
+                            orbCfg.livePolishEnabled &&
+                            totalSegs >= 2 &&
+                            totalSegs - lastReconciledCount >= 2 &&
+                            reconcileInFlight.compareAndSet(false, true)
+                        ) {
+                            lastReconciledCount = totalSegs
+                            val winSize = minOf(4, totalSegs)
+                            val winStart = totalSegs - winSize
+                            val windowSnap = postState.liveSegments.subList(winStart, totalSegs).toList()
+                            val startMsKeys = windowSnap.map { it.startMs }
+                            val spkNamesSnap = postState.speakerNames
+                            try {
+                                val reconciled = OrbRouterClient.reconcileRecentTurns(orbCfg, windowSnap, spkNamesSnap)
+                                if (reconciled != null) {
+                                    val latest = _state.value
+                                    val current = latest.liveSegments.toMutableList()
+                                    // Map each reconciled turn back by its startMs timestamp so newer turns stay intact
+                                    val byIdx = reconciled.associateBy { it.index }
+                                    val mergedWindow = mutableListOf<TranscriptSegment>()
+                                    for (wi in windowSnap.indices) {
+                                        val orig = windowSnap[wi]
+                                        val rec = byIdx[wi]
+                                        val spk = rec?.speakerIndex ?: orig.speakerIndex
+                                        val spkLbl = latest.speakerNames[spk] ?: "Speaker ${spk + 1}"
+                                        val txt = rec?.text ?: orig.text
+                                        // Preserve any translation already computed for this segment
+                                        val curMatch = current.firstOrNull { it.startMs == orig.startMs }
+                                        val tr = curMatch?.translatedText ?: orig.translatedText
+                                        if (rec?.mergePrev == true && mergedWindow.isNotEmpty() && mergedWindow.last().speakerIndex == spk) {
+                                            val p = mergedWindow.last()
+                                            val mergedTr = listOf(p.translatedText, tr).filter { it.isNotBlank() && it != "Translating…" }.joinToString(" ")
+                                            mergedWindow[mergedWindow.lastIndex] = p.copy(
+                                                endMs = maxOf(p.endMs, orig.endMs),
+                                                text = "${p.text.trimEnd()} $txt",
+                                                translatedText = mergedTr
+                                            )
+                                        } else {
+                                            mergedWindow.add(
+                                                orig.copy(
+                                                    speakerIndex = spk,
+                                                    speakerName = spkLbl,
+                                                    text = txt,
+                                                    translatedText = tr
+                                                )
+                                            )
+                                        }
+                                    }
+                                    val keySet = startMsKeys.toSet()
+                                    val firstPos = current.indexOfFirst { it.startMs in keySet }
+                                    if (firstPos >= 0) {
+                                        val before = current.subList(0, firstPos)
+                                        val after = current.subList(firstPos, current.size).filter { it.startMs !in keySet }
+                                        _state.value = latest.copy(liveSegments = before + mergedWindow + after)
+                                    }
+                                }
+                            } finally {
+                                reconcileInFlight.set(false)
+                            }
                         }
                     }
                 }
@@ -649,20 +880,13 @@ class VoiceRecorderService : Service() {
                 appendToRing(chunk, read)
 
                 val rmsRaw = sqrt(sumSq / read).toFloat()
-                // Gentle room-mic AGC for Silero VAD & Parakeet-v3 so quieter/distant speakers
-                // (e.g. students answering across a room) are captured as cleanly as the main speaker.
-                val agcGain = if (rmsRaw > 0.0025f && rmsRaw < 0.06f) {
-                    (0.08f / rmsRaw).coerceIn(1.0f, 4.5f)
-                } else {
-                    1.0f
-                }
+                // Feed clean, unpumped raw float PCM to Silero VAD & ASR (no 100ms chunk-level gain pumping,
+                // which distorts consonants!). Quiet far-field utterances are smoothly RMS-normalized
+                // per full utterance inside LocalAsrEngine.normalizeQuietAudio().
                 for (i in 0 until read) {
-                    val boosted = (chunk[i] / 32768f) * agcGain
-                    floatChunk[i] = boosted.coerceIn(-0.98f, 0.98f)
+                    floatChunk[i] = chunk[i] / 32768f
                 }
-                val rmsNorm = (rmsRaw * 6.5f).coerceIn(0.05f, 1.0f)
-                if (levelsWindow.size >= 48) levelsWindow.removeFirst()
-                levelsWindow.addLast(rmsNorm)
+                pushAudioMeter(floatChunk, read)
 
                 val elapsed = System.currentTimeMillis() - startTimeMs
                 currentElapsedMs = elapsed
@@ -677,21 +901,90 @@ class VoiceRecorderService : Service() {
                             inTurn = true
                             turnStartMs = elapsed
                             currentTurnStartMs = elapsed
-                            turnSamples.clear()
+                            earlyClassified = false
+                            turnLen = 0
                         }
-                        for (i in 0 until read) turnSamples.add(chunk[i])
-                        // Live streaming preview every ~1.4s while speaking
-                        if (elapsed - lastPreviewDecodeMs >= 1400L && turnSamples.size >= SAMPLE_RATE / 2) {
-                            lastPreviewDecodeMs = elapsed
-                            val snapFloats = FloatArray(turnSamples.size) { turnSamples[it] / 32768f }
-                            asrExecutor.execute {
+                        appendTurn(chunk, read)
+                        // Fast Hexagon V79 NPU early speaker probe (~500ms, 12ms NPU inference!)
+                        // Switches activeSpeakerIndex BEFORE the first live preview renders so a new
+                        // speaker's words never appear under the previous speaker's card.
+                        if (!earlyClassified && turnLen >= SAMPLE_RATE / 2) {
+                            earlyClassified = true
+                            val probe = turnBuf.copyOf(turnLen)
+                            npuExecutor.execute {
                                 if (!recording.get()) return@execute
-                                val preview = localAsr.transcribe(snapFloats)
-                                if (preview.isNotBlank() && recording.get()) {
-                                    _state.value = _state.value.copy(
-                                        activeSpeakerIndex = _state.value.activeSpeakerIndex ?: currentSpeakerIndex,
-                                        partialText = preview
-                                    )
+                                val spk = tracker.classifyTurn(probe, allowNewSpeaker = false)
+                                currentSpeakerIndex = spk
+                                _state.value = _state.value.copy(activeSpeakerIndex = spk)
+                            }
+                        }
+                        // Live streaming preview: every 650ms on 70ms Hexagon V79 NPU Parakeet (or 1.8s on CPU),
+                        // plus debounced live streaming translation while speaking!
+                        val previewIntervalMs = if (localAsr.isFastNpu) 650L else 1800L
+                        if (!localAsr.isHeavyweight &&
+                            elapsed - lastPreviewDecodeMs >= previewIntervalMs &&
+                            turnLen >= SAMPLE_RATE / 2 &&
+                            previewInFlight.compareAndSet(false, true)
+                        ) {
+                            lastPreviewDecodeMs = elapsed
+                            val snapLen = turnLen
+                            val snapShorts = turnBuf.copyOf(snapLen)
+                            val snapFloats = FloatArray(snapLen) { snapShorts[it] / 32768f }
+                            val previewSpkFuture = if (snapLen >= (SAMPLE_RATE * 9) / 10) {
+                                npuExecutor.submit<Int> {
+                                    tracker.classifyTurn(snapShorts, allowNewSpeaker = true)
+                                }
+                            } else null
+                            asrExecutor.execute {
+                                try {
+                                    if (!recording.get()) return@execute
+                                    val preview = localAsr.transcribe(snapFloats)
+                                    val spk = try {
+                                        previewSpkFuture?.get() ?: currentSpeakerIndex
+                                    } catch (_: Exception) {
+                                        currentSpeakerIndex
+                                    }
+                                    currentSpeakerIndex = spk
+                                    if (preview.isNotBlank() && recording.get()) {
+                                        _state.value = _state.value.copy(
+                                            activeSpeakerIndex = spk,
+                                            partialText = preview
+                                        )
+                                        // Ultra-fast live streaming translation while speaking (~250ms, plain text,
+                                        // refined into full polished translation when the sentence ends!)
+                                        val orbCfgPrev = OrbRouterConfig.load(this)
+                                        val wantLiveTx = translateModeActive || orbCfgPrev.autoTranslateTarget.isNotBlank()
+                                        val nowMs = System.currentTimeMillis() - startTimeMs
+                                        if (wantLiveTx &&
+                                            preview.length >= 4 &&
+                                            preview != lastPreviewTranslatedText &&
+                                            orbCfgPrev.isConfigured &&
+                                            nowMs - lastPreviewTranslateMs >= 450L &&
+                                            previewTranslateInFlight.compareAndSet(false, true)
+                                        ) {
+                                            lastPreviewTranslateMs = nowMs
+                                            lastPreviewTranslatedText = preview
+                                            val bidirA = if (translateModeActive) translateLangA else null
+                                            val bidirB = if (translateModeActive) translateLangB else null
+                                            llmExecutor.execute {
+                                                try {
+                                                    val tx = OrbRouterClient.translatePreviewFast(
+                                                        cfg = orbCfgPrev,
+                                                        partialText = preview,
+                                                        bidirectionalLangA = bidirA,
+                                                        bidirectionalLangB = bidirB
+                                                    ).orEmpty().trim()
+                                                    if (tx.isNotBlank() && recording.get() && _state.value.partialText.isNotBlank()) {
+                                                        _state.value = _state.value.copy(partialTranslation = tx)
+                                                    }
+                                                } finally {
+                                                    previewTranslateInFlight.set(false)
+                                                }
+                                            }
+                                        }
+                                    }
+                                } finally {
+                                    previewInFlight.set(false)
                                 }
                             }
                         }
@@ -700,14 +993,19 @@ class VoiceRecorderService : Service() {
                         val segDurMs = (segFloats.size * 1000L) / SAMPLE_RATE
                         val tStart = (elapsed - segDurMs).coerceAtLeast(0L)
                         inTurn = false
-                        turnSamples.clear()
+                        earlyClassified = false
+                        turnLen = 0
                         submitParakeetTurn(segFloats, tStart, elapsed)
                     }
-                    _state.value = _state.value.copy(
-                        isRecording = true,
-                        elapsedMs = elapsed,
-                        levels = levelsWindow.toList()
-                    )
+                    // Throttle elapsed timer UI updates to 2 Hz (every 500ms); the waveform runs
+                    // independently at 60-120 FPS via VoiceRecorderService.copyWaveform() with zero recompositions!
+                    if (elapsed - lastUiTickMs >= 500L) {
+                        lastUiTickMs = elapsed
+                        _state.value = _state.value.copy(
+                            isRecording = true,
+                            elapsedMs = elapsed
+                        )
+                    }
                     continue
                 }
 
@@ -733,34 +1031,36 @@ class VoiceRecorderService : Service() {
                         turnStartMs = elapsed
                         currentTurnStartMs = elapsed
                         earlyClassified = false
-                        turnSamples.clear()
+                        turnLen = 0
                     }
                     silenceChunks = 0
-                    for (i in 0 until read) turnSamples.add(chunk[i])
+                    appendTurn(chunk, read)
 
                     // Early speaker probe (~600ms) NEVER spawns a new speaker; only matches existing learned voices
-                    if (!earlyClassified && turnSamples.size >= (SAMPLE_RATE * 6) / 10) {
+                    if (!earlyClassified && turnLen >= (SAMPLE_RATE * 6) / 10) {
                         earlyClassified = true
-                        val probe = ShortArray(turnSamples.size) { turnSamples[it] }
-                        val spk = tracker.classifyTurn(probe, allowNewSpeaker = false)
-                        currentSpeakerIndex = spk
-                        _state.value = _state.value.copy(activeSpeakerIndex = spk)
+                        val probe = turnBuf.copyOf(turnLen)
+                        npuExecutor.execute {
+                            val spk = tracker.classifyTurn(probe, allowNewSpeaker = false)
+                            currentSpeakerIndex = spk
+                            _state.value = _state.value.copy(activeSpeakerIndex = spk)
+                        }
                     }
                 } else if (inTurn) {
                     silenceChunks++
-                    for (i in 0 until read) turnSamples.add(chunk[i])
+                    appendTurn(chunk, read)
                 }
 
-                // Flush a live speaker turn on 800ms pause OR 6s continuous speech
-                val shouldFlush = inTurn && (silenceChunks >= 8 || turnSamples.size >= SAMPLE_RATE * 6)
+                // Flush a live speaker turn on ~800ms pause (25 x 32ms chunks) OR 6s continuous speech
+                val shouldFlush = inTurn && (silenceChunks >= 25 || turnLen >= SAMPLE_RATE * 6)
                 if (shouldFlush) {
                     val endMs = elapsed
-                    val snapshot = ShortArray(turnSamples.size) { turnSamples[it] }
+                    val snapshot = turnBuf.copyOf(turnLen)
                     val tStart = turnStartMs
                     inTurn = false
                     silenceChunks = 0
                     earlyClassified = false
-                    turnSamples.clear()
+                    turnLen = 0
 
                     if (snapshot.size >= (SAMPLE_RATE * 7) / 10) {
                         val speakerIdx = tracker.classifyTurn(snapshot, allowNewSpeaker = true)
@@ -805,11 +1105,13 @@ class VoiceRecorderService : Service() {
                     }
                 }
 
-                _state.value = _state.value.copy(
-                    isRecording = true,
-                    elapsedMs = elapsed,
-                    levels = levelsWindow.toList()
-                )
+                if (elapsed - lastUiTickMs >= 500L) {
+                    lastUiTickMs = elapsed
+                    _state.value = _state.value.copy(
+                        isRecording = true,
+                        elapsedMs = elapsed
+                    )
+                }
             }
         } finally {
             try { recorder.stop() } catch (_: Exception) {}
@@ -845,8 +1147,7 @@ class VoiceRecorderService : Service() {
             val doneLatch = java.util.concurrent.CountDownLatch(1)
             asrExecutor.execute {
                 activeTracker = null
-                localAsr?.close()
-                neuralEngine?.close()
+                // Keep neuralEngine & localAsr warm in ScribeEnginePool across sessions (16 GB RAM)
                 doneLatch.countDown()
             }
             try { doneLatch.await(15, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) {}

@@ -1,0 +1,6 @@
+[project]
+name = "scribe-desktop"
+lean_toolchain = "lean-toolchain"
+
+[build]
+jobs = 4

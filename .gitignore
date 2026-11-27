@@ -6,3 +6,9 @@
 build/
 local.properties
 __pycache__/
+
+# Desktop UI / Daemon / Lean build artifacts
+desktop/ui/node_modules/
+desktop/daemon/**/__pycache__/
+desktop/lean/.lake/
+desktop/linux_shell/scribe
