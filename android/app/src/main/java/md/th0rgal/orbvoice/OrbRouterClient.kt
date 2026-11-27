@@ -19,7 +19,8 @@ data class OrbRouterConfig(
     val translateLangA: String = "English",
     val translateLangB: String = "French",
     val localAsrModel: String = LocalAsrEngine.AsrModel.PARAKEET_NPU.id,
-    val hindsightToken: String = ""
+    val hindsightToken: String = "",
+    val elevenLabsApiKey: String = ""
 ) {
     val isConfigured: Boolean get() = baseUrl.isNotBlank() && apiKey.isNotBlank()
 
@@ -42,7 +43,8 @@ data class OrbRouterConfig(
                 translateLangB = prefs.getString("orb_translate_lang_b", "French") ?: "French",
                 localAsrModel = prefs.getString("local_asr_model", LocalAsrEngine.AsrModel.PARAKEET_NPU.id)
                     ?: LocalAsrEngine.AsrModel.PARAKEET_NPU.id,
-                hindsightToken = prefs.getString("hindsight_token", "") ?: ""
+                hindsightToken = prefs.getString("hindsight_token", "") ?: "",
+                elevenLabsApiKey = prefs.getString("elevenlabs_api_key", "") ?: ""
             )
         }
 
@@ -58,6 +60,7 @@ data class OrbRouterConfig(
                 .putString("orb_translate_lang_b", cfg.translateLangB.trim().ifEmpty { "French" })
                 .putString("local_asr_model", cfg.localAsrModel.trim().ifEmpty { LocalAsrEngine.AsrModel.PARAKEET_NPU.id })
                 .putString("hindsight_token", cfg.hindsightToken.trim())
+                .putString("elevenlabs_api_key", cfg.elevenLabsApiKey.trim())
                 .apply()
         }
     }

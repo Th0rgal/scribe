@@ -2054,6 +2054,8 @@ private fun SettingsModalSheet(
     var livePolishDraft by remember { mutableStateOf(orbCfg.livePolishEnabled) }
     var autoTranslateDraft by remember { mutableStateOf(orbCfg.autoTranslateTarget) }
     var localAsrDraft by remember { mutableStateOf(orbCfg.localAsrModel) }
+    var elevenLabsKeyDraft by remember { mutableStateOf(orbCfg.elevenLabsApiKey) }
+    var hindsightTokenDraft by remember { mutableStateOf(orbCfg.hindsightToken) }
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
     ModalBottomSheet(
@@ -2275,6 +2277,27 @@ private fun SettingsModalSheet(
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth()
             )
+            HorizontalDivider(color = OrbBorder)
+            Text(
+                text = "ELEVENLABS SCRIBE REALTIME & HINDSIGHT",
+                fontSize = 11.sp,
+                letterSpacing = 0.8.sp,
+                color = OrbFgSubtle
+            )
+            OutlinedTextField(
+                value = elevenLabsKeyDraft,
+                onValueChange = { elevenLabsKeyDraft = it },
+                label = { Text("ElevenLabs API Key (scribe_v2_realtime)") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth()
+            )
+            OutlinedTextField(
+                value = hindsightTokenDraft,
+                onValueChange = { hindsightTokenDraft = it },
+                label = { Text("Hindsight API Token") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth()
+            )
             Button(
                 onClick = {
                     onSave(
@@ -2289,7 +2312,9 @@ private fun SettingsModalSheet(
                             autoTranslateTarget = autoTranslateDraft,
                             translateLangA = orbCfg.translateLangA,
                             translateLangB = orbCfg.translateLangB,
-                            localAsrModel = localAsrDraft
+                            localAsrModel = localAsrDraft,
+                            hindsightToken = hindsightTokenDraft,
+                            elevenLabsApiKey = elevenLabsKeyDraft
                         )
                     )
                 },

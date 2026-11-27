@@ -61,6 +61,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
     implementation("androidx.activity:activity-compose:1.9.3")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
     // Hexagon V79 NPU acceleration via ONNX Runtime QNN Execution Provider (1.29.0 bundles V79 Skel/Stub!)
     implementation("com.microsoft.onnxruntime:onnxruntime-android-qnn:1.29.0")

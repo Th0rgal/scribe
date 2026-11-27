@@ -613,7 +613,6 @@ class VoiceRecorderService : Service() {
             sparkOnline -> "${tracker.engineName} + Spark"
             else -> "${tracker.engineName} + SODA"
         }
-        _state.value = _state.value.copy(statusMessage = "Listening · $activeEngineTag")
 
         // Zero-GC primitive ShortArray turn buffer (replaces ArrayList<Short> boxing of 100k+ Short objects/turn)
         val turnBuf = ShortArray(SAMPLE_RATE * 10)
@@ -625,6 +624,61 @@ class VoiceRecorderService : Service() {
                 turnLen += copy
             }
         }
+
+        // Optional ElevenLabs Scribe v2 Realtime WebSocket STT (falls back automatically to local Parakeet NPU)
+        val elCfg = OrbRouterConfig.load(this)
+        val elevenLabsClient: ElevenLabsScribeClient? = if (elCfg.elevenLabsApiKey.isNotBlank()) {
+            ElevenLabsScribeClient(
+                apiKey = elCfg.elevenLabsApiKey,
+                sampleRate = SAMPLE_RATE,
+                vadSilenceThresholdSecs = 1.3,
+                onPartial = { text ->
+                    if (recording.get()) {
+                        _state.value = _state.value.copy(partialText = text)
+                    }
+                },
+                onCommitted = { text ->
+                    if (!recording.get()) return@ElevenLabsScribeClient
+                    val endNow = System.currentTimeMillis() - startTimeMs
+                    val snapLen = turnLen
+                    val snap = if (snapLen > 0) turnBuf.copyOf(snapLen) else ShortArray(0)
+                    turnLen = 0
+                    val durMs = (snap.size * 1000L) / SAMPLE_RATE
+                    val tStart = (endNow - durMs).coerceAtLeast(0L)
+                    npuExecutor.execute {
+                        val spkIdx = if (snap.size >= SAMPLE_RATE / 2) {
+                            tracker.classifyTurn(snap, allowNewSpeaker = true)
+                        } else {
+                            currentSpeakerIndex
+                        }
+                        currentSpeakerIndex = spkIdx
+                        val cur = _state.value
+                        val spkName = cur.speakerNames[spkIdx] ?: "Speaker ${spkIdx + 1}"
+                        val seg = TranscriptSegment(
+                            speakerIndex = spkIdx,
+                            speakerName = spkName,
+                            startMs = tStart,
+                            endMs = endNow,
+                            text = text
+                        )
+                        _state.value = cur.copy(
+                            activeSpeakerIndex = spkIdx,
+                            partialText = "",
+                            liveSegments = cur.liveSegments + seg
+                        )
+                    }
+                },
+                onFailure = { _ ->
+                    if (recording.get()) {
+                        _state.value = _state.value.copy(statusMessage = "Listening · $activeEngineTag")
+                    }
+                }
+            ).takeIf { it.start() }
+        } else {
+            null
+        }
+        val statusTag = if (elevenLabsClient != null) "ElevenLabs Scribe v2 Realtime" else activeEngineTag
+        _state.value = _state.value.copy(statusMessage = "Listening · $statusTag")
         var inTurn = false
         var turnStartMs = 0L
         var silenceChunks = 0
@@ -891,6 +945,13 @@ class VoiceRecorderService : Service() {
                 val elapsed = System.currentTimeMillis() - startTimeMs
                 currentElapsedMs = elapsed
 
+                // === PATH 0: ElevenLabs Scribe v2 Realtime WebSocket (~150ms live partials + VAD commits) ===
+                if (elevenLabsClient != null && elevenLabsClient.isHealthy) {
+                    appendTurn(chunk, read)
+                    elevenLabsClient.sendPcm(chunk, read)
+                    continue
+                }
+
                 // === PATH 1: Local Parakeet-TDT-0.6B-v3 + Silero VAD v5 (100% open-weights offline EN+FR!) ===
                 if (localAsr != null && localAsr.hasSileroVad) {
                     val slice = if (read == floatChunk.size) floatChunk else floatChunk.copyOf(read)
@@ -1126,6 +1187,7 @@ class VoiceRecorderService : Service() {
                     submitParakeetTurn(segFloats, (endNow - segDurMs).coerceAtLeast(0L), endNow)
                 }
             }
+            elevenLabsClient?.close()
             stopOnDeviceSpeechRecognizer()
         }
 
