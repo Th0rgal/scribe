@@ -16,15 +16,26 @@ final class ScribeAppDelegate: NSObject, NSApplicationDelegate {
         )
         window.title = "Scribe"
         window.titlebarAppearsTransparent = true
+        window.isOpaque = false
+        window.backgroundColor = .clear
         window.center()
+
+        let vibrancy = NSVisualEffectView(frame: rect)
+        vibrancy.autoresizingMask = [.width, .height]
+        vibrancy.blendingMode = .behindWindow
+        vibrancy.material = .underWindowBackground
+        vibrancy.state = .active
 
         let config = WKWebViewConfiguration()
         webView = WKWebView(frame: rect, configuration: config)
         webView.autoresizingMask = [.width, .height]
+        webView.setValue(false, forKey: "drawsBackground")
         if let url = URL(string: urlString) {
             webView.load(URLRequest(url: url))
         }
-        window.contentView = webView
+
+        vibrancy.addSubview(webView)
+        window.contentView = vibrancy
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }

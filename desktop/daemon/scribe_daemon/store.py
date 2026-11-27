@@ -1,12 +1,16 @@
-"""Local Markdown + Voice Notes store with SQLite FTS5 index and sync state."""
+"""Local Markdown + Voice Notes store with SQLite FTS5 index, sync state, and voiceprints."""
 from __future__ import annotations
 
 import hashlib
+import json
+import math
+import re
 import sqlite3
 import time
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 
 @dataclass
@@ -25,6 +29,7 @@ class NoteStore:
         self.notes_dir = notes_dir.expanduser().resolve()
         self.notes_dir.mkdir(parents=True, exist_ok=True)
         state_db.parent.mkdir(parents=True, exist_ok=True)
+        self.voiceprints_json = state_db.parent / "voiceprints.json"
         self.conn = sqlite3.connect(str(state_db), check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL;")
         self.conn.execute(
@@ -46,7 +51,315 @@ class NoteStore:
             )
             """
         )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS voiceprints (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                embedding_json TEXT NOT NULL DEFAULT '[]',
+                sample_count INTEGER NOT NULL DEFAULT 1,
+                source TEXT NOT NULL DEFAULT 'desktop',
+                notes TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
         self.conn.commit()
+        self._import_voiceprints_json_if_empty()
+
+    def _import_voiceprints_json_if_empty(self) -> None:
+        count = self.conn.execute("SELECT COUNT(*) FROM voiceprints").fetchone()[0]
+        if count > 0 or not self.voiceprints_json.is_file():
+            return
+        try:
+            items = json.loads(self.voiceprints_json.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not isinstance(items, list):
+            return
+        now = time.time()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            if not name:
+                continue
+            emb = item.get("embedding")
+            emb_list = emb if isinstance(emb, list) else []
+            vp_id = str(item.get("id") or uuid.uuid4().hex[:12])
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO voiceprints
+                    (id, name, embedding_json, sample_count, source, notes, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    vp_id,
+                    name,
+                    json.dumps(emb_list),
+                    int(item.get("sample_count") or 1),
+                    str(item.get("source") or "imported"),
+                    str(item.get("notes") or ""),
+                    float(item.get("created_at") or now),
+                    float(item.get("updated_at") or now),
+                ),
+            )
+        self.conn.commit()
+
+    def _export_voiceprints_json(self) -> None:
+        rows = self.conn.execute(
+            "SELECT id, name, embedding_json, sample_count, source, notes, created_at, updated_at FROM voiceprints ORDER BY updated_at DESC"
+        ).fetchall()
+        payload = []
+        for r in rows:
+            try:
+                emb = json.loads(r[2]) if r[2] else []
+            except Exception:
+                emb = []
+            payload.append(
+                {
+                    "id": r[0],
+                    "name": r[1],
+                    "embedding": emb,
+                    "sample_count": r[3],
+                    "source": r[4],
+                    "notes": r[5],
+                    "created_at": r[6],
+                    "updated_at": r[7],
+                }
+            )
+        tmp = self.voiceprints_json.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(self.voiceprints_json)
+
+    @staticmethod
+    def _normalize_embedding(vec: list[float]) -> list[float]:
+        norm = math.sqrt(sum(v * v for v in vec))
+        if norm < 1e-8:
+            return vec
+        return [round(v / norm, 6) for v in vec]
+
+    def list_voiceprints(self, include_embeddings: bool = False) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT id, name, embedding_json, sample_count, source, notes, created_at, updated_at FROM voiceprints ORDER BY updated_at DESC"
+        ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            try:
+                emb = json.loads(r[2]) if r[2] else []
+            except Exception:
+                emb = []
+            item: dict[str, Any] = {
+                "id": r[0],
+                "name": r[1],
+                "embedding_dim": len(emb),
+                "sample_count": r[3],
+                "source": r[4],
+                "notes": r[5],
+                "created_at": r[6],
+                "updated_at": r[7],
+            }
+            if include_embeddings:
+                item["embedding"] = emb
+            out.append(item)
+        return out
+
+    def create_voiceprint(
+        self,
+        name: str,
+        embedding: Optional[list[float]] = None,
+        sample_count: int = 1,
+        source: str = "desktop",
+        notes: str = "",
+    ) -> dict[str, Any]:
+        clean = name.strip()
+        if not clean:
+            raise ValueError("Voiceprint name is required")
+        now = time.time()
+        vp_id = uuid.uuid4().hex[:12]
+        emb = [float(x) for x in embedding] if isinstance(embedding, list) else []
+        if emb:
+            emb = self._normalize_embedding(emb)
+        self.conn.execute(
+            """
+            INSERT INTO voiceprints (id, name, embedding_json, sample_count, source, notes, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (vp_id, clean, json.dumps(emb), max(1, int(sample_count)), source, notes, now, now),
+        )
+        self.conn.commit()
+        self._export_voiceprints_json()
+        return {
+            "id": vp_id,
+            "name": clean,
+            "embedding_dim": len(emb),
+            "sample_count": max(1, int(sample_count)),
+            "source": source,
+            "notes": notes,
+            "created_at": now,
+            "updated_at": now,
+        }
+
+    def update_voiceprint(
+        self,
+        vp_id: str,
+        name: Optional[str] = None,
+        notes: Optional[str] = None,
+        relabel_notes: bool = False,
+    ) -> dict[str, Any]:
+        row = self.conn.execute(
+            "SELECT id, name, embedding_json, sample_count, source, notes, created_at FROM voiceprints WHERE id = ?",
+            (vp_id,),
+        ).fetchone()
+        if not row:
+            raise FileNotFoundError(vp_id)
+        old_name = row[1]
+        new_name = name.strip() if name is not None and name.strip() else old_name
+        new_notes = notes if notes is not None else row[5]
+        now = time.time()
+        self.conn.execute(
+            "UPDATE voiceprints SET name = ?, notes = ?, updated_at = ? WHERE id = ?",
+            (new_name, new_notes, now, vp_id),
+        )
+        self.conn.commit()
+        self._export_voiceprints_json()
+        relabeled = 0
+        if relabel_notes and new_name != old_name:
+            relabeled = self.relabel_speaker_in_notes(old_name, new_name)
+        emb = json.loads(row[2]) if row[2] else []
+        return {
+            "id": vp_id,
+            "name": new_name,
+            "embedding_dim": len(emb),
+            "sample_count": row[3],
+            "source": row[4],
+            "notes": new_notes,
+            "created_at": row[6],
+            "updated_at": now,
+            "relabeled_notes": relabeled,
+        }
+
+    def merge_voiceprints(
+        self,
+        ids: list[str],
+        target_name: str,
+        relabel_notes: bool = True,
+    ) -> dict[str, Any]:
+        unique_ids = list(dict.fromkeys(i for i in ids if i))
+        if len(unique_ids) < 2:
+            raise ValueError("Select at least 2 voiceprints to merge")
+        clean_target = target_name.strip()
+        if not clean_target:
+            raise ValueError("Target name is required")
+
+        placeholders = ",".join("?" for _ in unique_ids)
+        rows = self.conn.execute(
+            f"SELECT id, name, embedding_json, sample_count, notes FROM voiceprints WHERE id IN ({placeholders})",
+            unique_ids,
+        ).fetchall()
+        if len(rows) < 2:
+            raise ValueError("Could not find at least 2 matching voiceprints")
+
+        total_samples = 0
+        weighted_sum: Optional[list[float]] = None
+        old_names: list[str] = []
+        merged_notes: list[str] = []
+
+        for r in rows:
+            old_names.append(r[1])
+            samples = max(1, int(r[3] or 1))
+            total_samples += samples
+            if r[4]:
+                merged_notes.append(r[4])
+            try:
+                emb = [float(x) for x in json.loads(r[2] or "[]")]
+            except Exception:
+                emb = []
+            if emb:
+                if weighted_sum is None:
+                    weighted_sum = [v * samples for v in emb]
+                elif len(emb) == len(weighted_sum):
+                    weighted_sum = [a + b * samples for a, b in zip(weighted_sum, emb)]
+
+        merged_emb = self._normalize_embedding(weighted_sum) if weighted_sum else []
+        keep_id = rows[0][0]
+        drop_ids = [r[0] for r in rows[1:]]
+        now = time.time()
+
+        self.conn.execute(
+            """
+            UPDATE voiceprints
+            SET name = ?, embedding_json = ?, sample_count = ?, source = 'merged', notes = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                clean_target,
+                json.dumps(merged_emb),
+                total_samples,
+                " | ".join(dict.fromkeys(merged_notes)),
+                now,
+                keep_id,
+            ),
+        )
+        drop_ph = ",".join("?" for _ in drop_ids)
+        self.conn.execute(f"DELETE FROM voiceprints WHERE id IN ({drop_ph})", drop_ids)
+        self.conn.commit()
+        self._export_voiceprints_json()
+
+        relabeled = 0
+        if relabel_notes:
+            for old in set(old_names):
+                if old != clean_target:
+                    relabeled += self.relabel_speaker_in_notes(old, clean_target)
+
+        return {
+            "id": keep_id,
+            "name": clean_target,
+            "embedding_dim": len(merged_emb),
+            "sample_count": total_samples,
+            "merged_count": len(rows),
+            "relabeled_notes": relabeled,
+        }
+
+    def delete_voiceprint(self, vp_id: str) -> None:
+        self.conn.execute("DELETE FROM voiceprints WHERE id = ?", (vp_id,))
+        self.conn.commit()
+        self._export_voiceprints_json()
+
+    def relabel_speaker_in_notes(
+        self,
+        from_label: str,
+        to_label: str,
+        rel_path: Optional[str] = None,
+    ) -> int:
+        src = from_label.strip()
+        dst = to_label.strip()
+        if not src or not dst or src == dst:
+            return 0
+        targets = [self._safe_path(rel_path)] if rel_path else list(self.notes_dir.rglob("*.md"))
+        esc = re.escape(src)
+        patterns = [
+            (re.compile(rf"(\*\*){esc}(\*\*:)"), rf"\1{dst}\2"),
+            (re.compile(rf"(\*\*){esc}(:\*\*)"), rf"\1{dst}\2"),
+            (re.compile(rf"(\[){esc}(\])"), rf"\1{dst}\2"),
+            (re.compile(rf"(?m)^({esc})(\s*:)"), rf"{dst}\2"),
+        ]
+        updated = 0
+        for p in targets:
+            if not p.is_file():
+                continue
+            try:
+                md = p.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            new_md = md
+            for pat, repl in patterns:
+                new_md = pat.sub(repl, new_md)
+            if new_md != md:
+                self.write_note(p.relative_to(self.notes_dir).as_posix(), new_md)
+                updated += 1
+        return updated
 
     def _safe_path(self, rel_path: str) -> Path:
         clean = rel_path.replace("\\", "/").lstrip("/")

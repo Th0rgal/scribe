@@ -1,4 +1,4 @@
-package com.th0rgal.orbvoice
+package md.th0rgal.orbvoice
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border

@@ -1,4 +1,4 @@
-package com.th0rgal.orbvoice
+package md.th0rgal.orbvoice
 
 import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment

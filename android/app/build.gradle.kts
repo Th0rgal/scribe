@@ -5,11 +5,11 @@ plugins {
 }
 
 android {
-    namespace = "com.th0rgal.orbvoice"
+    namespace = "md.th0rgal.orbvoice"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.th0rgal.orbvoice"
+        applicationId = "md.th0rgal.orbvoice"
         minSdk = 31
         targetSdk = 35
         versionCode = 1

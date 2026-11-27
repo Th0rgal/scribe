@@ -1,4 +1,4 @@
-package com.th0rgal.orbvoice
+package md.th0rgal.orbvoice
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext

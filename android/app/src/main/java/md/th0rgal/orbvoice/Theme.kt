@@ -1,4 +1,4 @@
-package com.th0rgal.orbvoice
+package md.th0rgal.orbvoice
 
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme

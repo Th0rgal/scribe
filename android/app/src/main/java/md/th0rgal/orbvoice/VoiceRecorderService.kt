@@ -1,4 +1,4 @@
-package com.th0rgal.orbvoice
+package md.th0rgal.orbvoice
 
 import android.Manifest
 import android.app.Notification
@@ -74,9 +74,9 @@ data class RecorderState(
 class VoiceRecorderService : Service() {
 
     companion object {
-        const val ACTION_START = "com.th0rgal.orbvoice.START"
-        const val ACTION_STOP = "com.th0rgal.orbvoice.STOP"
-        const val ACTION_BENCHMARK = "com.th0rgal.orbvoice.BENCHMARK"
+        const val ACTION_START = "md.th0rgal.orbvoice.START"
+        const val ACTION_STOP = "md.th0rgal.orbvoice.STOP"
+        const val ACTION_BENCHMARK = "md.th0rgal.orbvoice.BENCHMARK"
         const val EXTRA_TRANSLATE_MODE = "translate_mode"
         const val EXTRA_LANG_A = "lang_a"
         const val EXTRA_LANG_B = "lang_b"

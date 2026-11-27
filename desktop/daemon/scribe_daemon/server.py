@@ -5,6 +5,7 @@ import json
 import mimetypes
 import os
 import threading
+import urllib.request
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -58,6 +59,9 @@ def make_handler(store: NoteStore, syncer: HindsightNoteSyncer, ui_dir: Path):
                     self._send_json(store.read_note(rel))
                 except FileNotFoundError:
                     self._send_json({"error": "not found"}, 404)
+                return
+            if path == "/api/voiceprints":
+                self._send_json({"voiceprints": store.list_voiceprints()})
                 return
             if path.startswith("/api/audio/"):
                 rel = unquote(path[len("/api/audio/"):])
@@ -116,6 +120,60 @@ def make_handler(store: NoteStore, syncer: HindsightNoteSyncer, ui_dir: Path):
                 self._send_json(note)
                 return
 
+            if parsed.path == "/api/voiceprints":
+                try:
+                    vp = store.create_voiceprint(
+                        name=str(body.get("name") or ""),
+                        embedding=body.get("embedding"),
+                        sample_count=int(body.get("sample_count") or 1),
+                        source=str(body.get("source") or "desktop"),
+                        notes=str(body.get("notes") or ""),
+                    )
+                    self._send_json(vp, 201)
+                except ValueError as exc:
+                    self._send_json({"error": str(exc)}, 400)
+                return
+
+            if parsed.path == "/api/voiceprints/merge":
+                try:
+                    merged = store.merge_voiceprints(
+                        ids=list(body.get("ids") or []),
+                        target_name=str(body.get("target_name") or ""),
+                        relabel_notes=bool(body.get("relabel_notes", True)),
+                    )
+                    self._send_json(merged)
+                except ValueError as exc:
+                    self._send_json({"error": str(exc)}, 400)
+                return
+
+            if parsed.path == "/api/voiceprints/apply":
+                from_label = str(body.get("from_label") or "")
+                to_label = str(body.get("to_label") or "")
+                rel_path = body.get("rel_path")
+                count = store.relabel_speaker_in_notes(from_label, to_label, rel_path=rel_path)
+                self._send_json({"updated": count, "from_label": from_label, "to_label": to_label})
+                return
+
+            if parsed.path == "/api/voiceprints/sync-spark":
+                spark_url = (os.environ.get("SPARK_VOICE_URL") or "").rstrip("/")
+                if not spark_url:
+                    self._send_json({"synced": False, "reason": "SPARK_VOICE_URL not set"})
+                    return
+                try:
+                    vps = store.list_voiceprints(include_embeddings=True)
+                    req = urllib.request.Request(
+                        f"{spark_url}/v1/voiceprints",
+                        data=json.dumps({"voiceprints": vps}).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        res = json.loads(resp.read().decode("utf-8"))
+                    self._send_json({"synced": True, "remote": res})
+                except Exception as exc:
+                    self._send_json({"synced": False, "error": str(exc)}, 502)
+                return
+
             if parsed.path == "/api/sync":
                 pull_res = syncer.pull_notes(store)
                 pushed = 0
@@ -136,6 +194,24 @@ def make_handler(store: NoteStore, syncer: HindsightNoteSyncer, ui_dir: Path):
 
             self.send_error(HTTPStatus.NOT_FOUND)
 
+        def do_PATCH(self) -> None:
+            parsed = urlparse(self.path)
+            body = self._read_json()
+            if parsed.path == "/api/voiceprints":
+                vp_id = str(body.get("id") or "")
+                try:
+                    updated = store.update_voiceprint(
+                        vp_id=vp_id,
+                        name=body.get("name"),
+                        notes=body.get("notes"),
+                        relabel_notes=bool(body.get("relabel_notes", True)),
+                    )
+                    self._send_json(updated)
+                except FileNotFoundError:
+                    self._send_json({"error": "not found"}, 404)
+                return
+            self.send_error(HTTPStatus.NOT_FOUND)
+
         def do_DELETE(self) -> None:
             parsed = urlparse(self.path)
             qs = parse_qs(parsed.query)
@@ -143,6 +219,11 @@ def make_handler(store: NoteStore, syncer: HindsightNoteSyncer, ui_dir: Path):
                 rel = (qs.get("path") or [""])[0]
                 store.delete_note(rel)
                 self._send_json({"deleted": rel})
+                return
+            if parsed.path == "/api/voiceprints":
+                vp_id = (qs.get("id") or [""])[0]
+                store.delete_voiceprint(vp_id)
+                self._send_json({"deleted": vp_id})
                 return
             self.send_error(HTTPStatus.NOT_FOUND)
 
