@@ -18,7 +18,8 @@ data class OrbRouterConfig(
     val autoTranslateTarget: String = "",
     val translateLangA: String = "English",
     val translateLangB: String = "French",
-    val localAsrModel: String = LocalAsrEngine.AsrModel.PARAKEET_NPU.id
+    val localAsrModel: String = LocalAsrEngine.AsrModel.PARAKEET_NPU.id,
+    val hindsightToken: String = ""
 ) {
     val isConfigured: Boolean get() = baseUrl.isNotBlank() && apiKey.isNotBlank()
 
@@ -40,7 +41,8 @@ data class OrbRouterConfig(
                 translateLangA = prefs.getString("orb_translate_lang_a", "English") ?: "English",
                 translateLangB = prefs.getString("orb_translate_lang_b", "French") ?: "French",
                 localAsrModel = prefs.getString("local_asr_model", LocalAsrEngine.AsrModel.PARAKEET_NPU.id)
-                    ?: LocalAsrEngine.AsrModel.PARAKEET_NPU.id
+                    ?: LocalAsrEngine.AsrModel.PARAKEET_NPU.id,
+                hindsightToken = prefs.getString("hindsight_token", "") ?: ""
             )
         }
 
@@ -55,6 +57,7 @@ data class OrbRouterConfig(
                 .putString("orb_translate_lang_a", cfg.translateLangA.trim().ifEmpty { "English" })
                 .putString("orb_translate_lang_b", cfg.translateLangB.trim().ifEmpty { "French" })
                 .putString("local_asr_model", cfg.localAsrModel.trim().ifEmpty { LocalAsrEngine.AsrModel.PARAKEET_NPU.id })
+                .putString("hindsight_token", cfg.hindsightToken.trim())
                 .apply()
         }
     }
