@@ -93,6 +93,14 @@ export function App() {
   const [isTranscribing, setIsTranscribing] = createSignal(false);
   const [recElapsed, setRecElapsed] = createSignal(0);
 
+  // Connected USB phone live stream + remote control
+  const [phoneConnected, setPhoneConnected] = createSignal(false);
+  const [phoneRecording, setPhoneRecording] = createSignal(false);
+  const [phonePaused, setPhonePaused] = createSignal(false);
+  const [phoneStatus, setPhoneStatus] = createSignal("");
+  const [phoneMarkdown, setPhoneMarkdown] = createSignal("");
+  const [viewingPhoneLive, setViewingPhoneLive] = createSignal(false);
+
   // Quick speaker relabel for current recording
   const [relabelSource, setRelabelSource] = createSignal<string | null>(null);
   const [relabelTarget, setRelabelTarget] = createSignal("");
@@ -115,7 +123,9 @@ export function App() {
     });
   });
 
-  const previewHtml = createMemo(() => renderMarkdownWithKatex(markdown()));
+  const previewHtml = createMemo(() =>
+    renderMarkdownWithKatex(viewingPhoneLive() ? phoneMarkdown() : markdown())
+  );
   const detectedSpeakers = createMemo(() => (currentIsVoice() ? detectSpeakers(markdown()) : []));
 
   function toggleMode() {
@@ -141,7 +151,58 @@ export function App() {
     }
   }
 
+  async function pollPhoneLive() {
+    try {
+      const res = await fetch("/api/phone/live");
+      if (!res.ok) return;
+      const d = await res.json();
+      if (!d.connected) {
+        setPhoneConnected(false);
+        return;
+      }
+      const wasRec = phoneRecording();
+      setPhoneConnected(true);
+      setPhoneRecording(Boolean(d.recording));
+      setPhonePaused(Boolean(d.paused));
+      setPhoneStatus(d.status || (d.recording ? "Recording on phone" : "Phone ready"));
+      const lines: string[] = [
+        `# 📱 Phone Live (${d.paused ? "Paused" : d.recording ? "Recording" : "Ready"})`,
+        "",
+      ];
+      for (const seg of d.segments || []) {
+        lines.push(`**${seg.speaker}**: ${seg.text}`);
+        if (seg.translated) lines.push(`*→ ${seg.translated}*`);
+        lines.push("");
+      }
+      if (d.partial) {
+        lines.push(`*… ${d.partial}*`);
+        if (d.partial_translation) lines.push(`*→ ${d.partial_translation}*`);
+      }
+      setPhoneMarkdown(lines.join("\n"));
+      if (d.recording && !wasRec) {
+        setViewingPhoneLive(true);
+        setMode("preview");
+      }
+    } catch {
+      setPhoneConnected(false);
+    }
+  }
+
+  async function sendPhoneControl(action: "start" | "pause" | "resume" | "stop") {
+    await fetch("/api/phone/control", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action }),
+    });
+    if (action === "start") {
+      setViewingPhoneLive(true);
+      setMode("preview");
+    }
+    setTimeout(pollPhoneLive, 350);
+  }
+
   async function openNote(relPath: string) {
+    setViewingPhoneLive(false);
     const res = await fetch(`/api/note?path=${encodeURIComponent(relPath)}`);
     if (!res.ok) return;
     const note = await res.json();
@@ -283,13 +344,16 @@ export function App() {
         createNote();
       }
     };
+    const phoneTimer = window.setInterval(pollPhoneLive, 1000);
     window.addEventListener("keydown", onKeyDown);
     onCleanup(() => {
       window.removeEventListener("keydown", onKeyDown);
       clearInterval(recTimer);
+      clearInterval(phoneTimer);
     });
 
     fetchNotes();
+    pollPhoneLive();
   });
 
   return (
@@ -325,6 +389,36 @@ export function App() {
         </div>
 
         <div class="note-list">
+          <Show when={phoneConnected()}>
+            <div
+              class={"note-item" + (viewingPhoneLive() ? " active" : "")}
+              onClick={() => {
+                setViewingPhoneLive(true);
+                setMode("preview");
+              }}
+            >
+              <div class="note-item-title">
+                📱 Phone Live {phoneRecording() ? (phonePaused() ? "· Paused" : "· ● Live") : "· Connected"}
+              </div>
+              <div class="note-item-preview">{phoneStatus()}</div>
+              <div class="rec-toggles" style="margin-top: 6px;" onClick={(e) => e.stopPropagation()}>
+                <Show
+                  when={phoneRecording()}
+                  fallback={
+                    <button class="rec-toggle on" onClick={() => sendPhoneControl("start")}>● Start</button>
+                  }
+                >
+                  <button
+                    class="rec-toggle on"
+                    onClick={() => sendPhoneControl(phonePaused() ? "resume" : "pause")}
+                  >
+                    {phonePaused() ? "▶ Resume" : "❚❚ Pause"}
+                  </button>
+                  <button class="rec-toggle" onClick={() => sendPhoneControl("stop")}>■ Stop</button>
+                </Show>
+              </div>
+            </div>
+          </Show>
           <For each={filteredNotes()}>
             {(n) => (
               <div

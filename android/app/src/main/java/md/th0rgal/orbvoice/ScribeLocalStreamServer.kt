@@ -1,5 +1,8 @@
 package md.th0rgal.orbvoice
 
+import android.content.Context
+import android.content.Intent
+import android.os.Build
 import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
@@ -13,19 +16,37 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Lightweight loopback-only HTTP + SSE server (`127.0.0.1:47922`) so a desktop/agent
- * connected over USB (`adb forward tcp:47922 tcp:47922`) can read or stream the live
- * Scribe transcript in real time:
- *   - GET /api/live      -> JSON snapshot (segments, partial, partial_translation, status)
- *   - GET /api/live.txt  -> Clean plain-text/Markdown transcript ready for LLM agents
- *   - GET /api/stream    -> Server-Sent Events (SSE) stream of live updates
+ * connected over USB (`adb forward tcp:47922 tcp:47922`) can read, stream, and remote-control
+ * Scribe in real time:
+ *   - GET /api/live                          -> JSON snapshot
+ *   - GET /api/live.txt                      -> Clean Markdown transcript for LLM agents
+ *   - GET /api/stream                        -> Server-Sent Events (SSE) live stream
+ *   - GET /api/control?action=start|pause|resume|stop -> Remote control recording
  */
 class ScribeLocalStreamServer(
+    private val appContext: Context,
     private val port: Int = DEFAULT_PORT,
     private val stateProvider: () -> RecorderState
 ) {
     companion object {
         const val DEFAULT_PORT = 47922
         private const val TAG = "ScribeStreamServer"
+        @Volatile
+        private var instance: ScribeLocalStreamServer? = null
+
+        fun ensureStarted(context: Context, stateProvider: () -> RecorderState): ScribeLocalStreamServer {
+            val existing = instance
+            if (existing != null) {
+                existing.start()
+                return existing
+            }
+            return synchronized(this) {
+                instance ?: ScribeLocalStreamServer(context.applicationContext, DEFAULT_PORT, stateProvider).also {
+                    instance = it
+                    it.start()
+                }
+            }
+        }
     }
 
     private val running = AtomicBoolean(false)
@@ -65,14 +86,39 @@ class ScribeLocalStreamServer(
         serverSocket = null
     }
 
+    private fun dispatchControl(actionName: String): Boolean {
+        val svcAction = when (actionName.lowercase()) {
+            "start" -> VoiceRecorderService.ACTION_START
+            "pause" -> VoiceRecorderService.ACTION_PAUSE
+            "resume" -> VoiceRecorderService.ACTION_RESUME
+            "stop" -> VoiceRecorderService.ACTION_STOP
+            else -> return false
+        }
+        val intent = Intent(appContext, VoiceRecorderService::class.java).apply {
+            action = svcAction
+        }
+        return try {
+            if (svcAction == VoiceRecorderService.ACTION_START && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                appContext.startForegroundService(intent)
+            } else {
+                appContext.startService(intent)
+            }
+            true
+        } catch (t: Throwable) {
+            Log.w(TAG, "Control $actionName failed: ${t.message}")
+            false
+        }
+    }
+
     private fun handleClient(socket: Socket) {
         socket.use { sock ->
             try {
                 sock.soTimeout = 5000
                 val reader = BufferedReader(InputStreamReader(sock.getInputStream(), Charsets.UTF_8))
                 val reqLine = reader.readLine() ?: return
-                val path = reqLine.split(" ").getOrNull(1)?.substringBefore("?") ?: "/"
-                // Drain headers
+                val fullTarget = reqLine.split(" ").getOrNull(1) ?: "/"
+                val path = fullTarget.substringBefore("?")
+                val query = fullTarget.substringAfter("?", "")
                 while (true) {
                     val line = reader.readLine() ?: break
                     if (line.isEmpty()) break
@@ -80,6 +126,18 @@ class ScribeLocalStreamServer(
 
                 val out = sock.getOutputStream()
                 when (path) {
+                    "/api/control" -> {
+                        val actionParam = query.split("&")
+                            .mapNotNull { kv -> kv.split("=").takeIf { it.size == 2 }?.let { it[0] to it[1] } }
+                            .toMap()["action"]
+                            .orEmpty()
+                        val ok = dispatchControl(actionParam)
+                        val body = JSONObject().apply {
+                            put("ok", ok)
+                            put("action", actionParam)
+                        }.toString().toByteArray(Charsets.UTF_8)
+                        writeResponse(out, "application/json; charset=utf-8", body)
+                    }
                     "/api/stream" -> {
                         sock.soTimeout = 0
                         val hdr = (
@@ -145,6 +203,7 @@ class ScribeLocalStreamServer(
         }
         return JSONObject().apply {
             put("recording", st.isRecording)
+            put("paused", st.isPaused)
             put("processing", st.isProcessing)
             put("elapsed_ms", st.elapsedMs)
             put("status", st.statusMessage)
@@ -158,7 +217,13 @@ class ScribeLocalStreamServer(
     private fun buildPlainText(st: RecorderState): String {
         val sb = StringBuilder()
         sb.append("# Scribe Live Transcript (")
-        sb.append(if (st.isRecording) "recording · ${VoiceNoteStore.formatTimestamp(st.elapsedMs)}" else "idle")
+        sb.append(
+            when {
+                st.isPaused -> "paused"
+                st.isRecording -> "recording · ${VoiceNoteStore.formatTimestamp(st.elapsedMs)}"
+                else -> "idle"
+            }
+        )
         sb.append(")\n\n")
         for (s in st.liveSegments) {
             val spk = st.speakerNames[s.speakerIndex] ?: s.speakerName

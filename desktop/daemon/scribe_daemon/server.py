@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import subprocess
 import threading
 import urllib.request
 from http import HTTPStatus
@@ -66,6 +67,29 @@ def make_handler(store: NoteStore, syncer: HindsightNoteSyncer, ui_dir: Path, re
                 return
             if path == "/api/record/status":
                 self._send_json(recorder.status())
+                return
+            if path == "/api/phone/live":
+                try:
+                    with urllib.request.urlopen("http://127.0.0.1:47922/api/live", timeout=1.2) as r:
+                        data = json.loads(r.read().decode("utf-8"))
+                    data["connected"] = True
+                    self._send_json(data)
+                except Exception:
+                    # Try auto-forwarding over USB via adb if a phone is plugged in
+                    try:
+                        subprocess.run(
+                            ["adb", "forward", "tcp:47922", "tcp:47922"],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=1.5,
+                            check=False,
+                        )
+                        with urllib.request.urlopen("http://127.0.0.1:47922/api/live", timeout=1.2) as r:
+                            data = json.loads(r.read().decode("utf-8"))
+                        data["connected"] = True
+                        self._send_json(data)
+                    except Exception:
+                        self._send_json({"connected": False})
                 return
             if path.startswith("/api/audio/"):
                 rel = unquote(path[len("/api/audio/"):])
@@ -176,6 +200,17 @@ def make_handler(store: NoteStore, syncer: HindsightNoteSyncer, ui_dir: Path, re
                     self._send_json({"synced": True, "remote": res})
                 except Exception as exc:
                     self._send_json({"synced": False, "error": str(exc)}, 502)
+                return
+
+            if parsed.path == "/api/phone/control":
+                action = str(body.get("action") or "").strip().lower()
+                try:
+                    with urllib.request.urlopen(
+                        f"http://127.0.0.1:47922/api/control?action={action}", timeout=2.0
+                    ) as r:
+                        self._send_json(json.loads(r.read().decode("utf-8")))
+                except Exception as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, 502)
                 return
 
             if parsed.path == "/api/record/start":

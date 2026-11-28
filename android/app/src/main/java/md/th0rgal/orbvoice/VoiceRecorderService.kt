@@ -272,18 +272,17 @@ class VoiceRecorderService : Service() {
         }
     }
 
-    private val streamServer = ScribeLocalStreamServer { _state.value }
     private val paused = AtomicBoolean(false)
 
     override fun onCreate() {
         super.onCreate()
-        streamServer.start()
+        ScribeLocalStreamServer.ensureStarted(applicationContext) { _state.value }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        streamServer.start()
+        ScribeLocalStreamServer.ensureStarted(applicationContext) { _state.value }
         when (intent?.action) {
             ACTION_START -> {
                 paused.set(false)
@@ -317,7 +316,6 @@ class VoiceRecorderService : Service() {
     }
 
     override fun onDestroy() {
-        streamServer.stop()
         recording.set(false)
         stopOnDeviceSpeechRecognizer()
         asrExecutor.shutdownNow()
