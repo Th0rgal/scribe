@@ -42,7 +42,6 @@ set -euo pipefail
 export SCRIBE_UI_DIST="@out@/share/scribe/ui"
 export SCRIBE_PORT="''${SCRIBE_PORT:-47921}"
 export SCRIBE_UI_URL="http://127.0.0.1:''${SCRIBE_PORT}/"
-export WEBKIT_DISABLE_DMABUF_RENDERER="''${WEBKIT_DISABLE_DMABUF_RENDERER:-1}"
 if [ "''${1:-}" = "--self-test" ]; then
   "@out@/bin/scribe-shell" --self-test
   "@locald@/bin/scribe-locald" --self-test

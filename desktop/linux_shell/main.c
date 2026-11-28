@@ -95,8 +95,10 @@ static void on_activate(GtkApplication *app, gpointer ud) {
         GTK_STYLE_PROVIDER_PRIORITY_APPLICATION
     );
 
-    /* Single WebKitGTK 6.0 canvas with transparent background for compositor blur */
+    /* Single WebKitGTK 6.0 canvas with hardware acceleration + transparent background for compositor blur */
     s->webview = webkit_web_view_new();
+    WebKitSettings *wks = webkit_web_view_get_settings(WEBKIT_WEB_VIEW(s->webview));
+    webkit_settings_set_hardware_acceleration_policy(wks, WEBKIT_HARDWARE_ACCELERATION_POLICY_ALWAYS);
     const GdkRGBA transparent = { 0.0, 0.0, 0.0, 0.0 };
     webkit_web_view_set_background_color(WEBKIT_WEB_VIEW(s->webview), &transparent);
     webkit_web_view_load_uri(WEBKIT_WEB_VIEW(s->webview), s->daemon_url);
