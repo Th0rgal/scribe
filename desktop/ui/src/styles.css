@@ -59,12 +59,14 @@ html, body, #root {
   min-width: 220px;
   display: flex;
   flex-direction: column;
-  background: rgba(18, 19, 19, 0.78);
+  background: rgba(18, 19, 19, 0.88);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
   isolation: isolate;
   border-right: 1px solid var(--border);
 }
 [data-theme="light"] .note-rail {
-  background: rgba(246, 246, 244, 0.72);
+  background: rgba(246, 246, 244, 0.86);
 }
 
 .rail-header {
