@@ -84,6 +84,7 @@ export function App() {
   const [audioPath, setAudioPath] = createSignal<string | null>(null);
   const [syncText, setSyncText] = createSignal("● Hindsight: thomas/scribe");
   const [mode, setMode] = createSignal<"preview" | "edit">("preview");
+  const [sidebarOpen, setSidebarOpen] = createSignal(true);
   const [theme, setTheme] = createSignal<"dark" | "light">("dark");
 
   // Desktop voice recorder (Mic + System Audio / Google Meet)
@@ -325,7 +326,11 @@ export function App() {
     (window as unknown as Record<string, unknown>).__SCRIBE_SET_THEME__ = (t: "dark" | "light") => setTheme(t);
     (window as unknown as Record<string, unknown>).__SCRIBE_NEW_NOTE__ = createNote;
     (window as unknown as Record<string, unknown>).__SCRIBE_TOGGLE_MODE__ = toggleMode;
-    (window as unknown as Record<string, unknown>).__SCRIBE_FOCUS_SEARCH__ = () => searchInputRef?.focus();
+    (window as unknown as Record<string, unknown>).__SCRIBE_TOGGLE_SIDEBAR__ = () => setSidebarOpen((v) => !v);
+    (window as unknown as Record<string, unknown>).__SCRIBE_FOCUS_SEARCH__ = () => {
+      setSidebarOpen(true);
+      requestAnimationFrame(() => searchInputRef?.focus());
+    };
     (window as unknown as Record<string, unknown>).__SCRIBE_FILTER__ = (q: string) => {
       setQuery(q);
       fetchNotes(q);
@@ -336,9 +341,13 @@ export function App() {
       if (mod && e.key === "/") {
         e.preventDefault();
         toggleMode();
+      } else if (mod && e.key.toLowerCase() === "b") {
+        e.preventDefault();
+        setSidebarOpen((v) => !v);
       } else if (mod && e.key.toLowerCase() === "k") {
         e.preventDefault();
-        searchInputRef?.focus();
+        setSidebarOpen(true);
+        requestAnimationFrame(() => searchInputRef?.focus());
       } else if (mod && e.key.toLowerCase() === "n") {
         e.preventDefault();
         createNote();
@@ -358,6 +367,7 @@ export function App() {
 
   return (
     <div class="scribe-shell">
+      <Show when={sidebarOpen()}>
       <aside class="note-rail">
         <div class="rail-header">
           <span class="rail-title">Scribe</span>
@@ -482,6 +492,7 @@ export function App() {
 
         <div class="sync-footer">{syncText()}</div>
       </aside>
+      </Show>
 
       <main class="canvas">
         <header class="canvas-bar">
