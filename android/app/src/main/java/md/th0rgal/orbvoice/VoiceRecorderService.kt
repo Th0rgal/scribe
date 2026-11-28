@@ -48,6 +48,7 @@ data class RecorderState(
     val isRecording: Boolean = false,
     val isProcessing: Boolean = false,
     val isTranslateMode: Boolean = false,
+    val isPaused: Boolean = false,
     val statusMessage: String = "Ready",
     val elapsedMs: Long = 0L,
     val levels: List<Float> = emptyList(),
@@ -76,6 +77,8 @@ class VoiceRecorderService : Service() {
     companion object {
         const val ACTION_START = "md.th0rgal.orbvoice.START"
         const val ACTION_STOP = "md.th0rgal.orbvoice.STOP"
+        const val ACTION_PAUSE = "md.th0rgal.orbvoice.PAUSE"
+        const val ACTION_RESUME = "md.th0rgal.orbvoice.RESUME"
         const val ACTION_BENCHMARK = "md.th0rgal.orbvoice.BENCHMARK"
         const val EXTRA_TRANSLATE_MODE = "translate_mode"
         const val EXTRA_LANG_A = "lang_a"
@@ -270,6 +273,7 @@ class VoiceRecorderService : Service() {
     }
 
     private val streamServer = ScribeLocalStreamServer { _state.value }
+    private val paused = AtomicBoolean(false)
 
     override fun onCreate() {
         super.onCreate()
@@ -282,12 +286,28 @@ class VoiceRecorderService : Service() {
         streamServer.start()
         when (intent?.action) {
             ACTION_START -> {
+                paused.set(false)
                 translateModeActive = intent.getBooleanExtra(EXTRA_TRANSLATE_MODE, false)
                 translateLangA = intent.getStringExtra(EXTRA_LANG_A) ?: "English"
                 translateLangB = intent.getStringExtra(EXTRA_LANG_B) ?: "French"
                 beginCapture()
             }
-            ACTION_STOP -> stopCapture()
+            ACTION_PAUSE -> {
+                if (recording.get()) {
+                    paused.set(true)
+                    _state.value = _state.value.copy(isPaused = true, statusMessage = "Paused · tap Resume")
+                }
+            }
+            ACTION_RESUME -> {
+                if (recording.get()) {
+                    paused.set(false)
+                    _state.value = _state.value.copy(isPaused = false, statusMessage = "Listening · resumed")
+                }
+            }
+            ACTION_STOP -> {
+                paused.set(false)
+                stopCapture()
+            }
             ACTION_BENCHMARK -> {
                 val wav = intent.getStringExtra("wav_path") ?: "/storage/emulated/0/Documents/OrbVoice/2026-11-24_22-02-52.wav"
                 Thread { LocalAsrEngine.runBenchmarkSuite(applicationContext, wav) }.start()
@@ -1020,6 +1040,10 @@ class VoiceRecorderService : Service() {
 
                 val elapsed = System.currentTimeMillis() - startTimeMs
                 currentElapsedMs = elapsed
+
+                if (paused.get()) {
+                    continue
+                }
 
                 // === PATH 0: ElevenLabs Scribe v2 Realtime WebSocket (~150ms live partials + VAD commits) ===
                 if (elevenLabsClient != null && elevenLabsClient.isHealthy) {

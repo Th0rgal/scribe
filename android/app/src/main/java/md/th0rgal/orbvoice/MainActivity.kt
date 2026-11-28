@@ -1354,6 +1354,24 @@ private fun HeroRecorderCard(recState: RecorderState, onToggleRecord: () -> Unit
                         color = OrbFgMuted
                     )
                 }
+                val ctx = LocalContext.current
+                androidx.compose.material3.OutlinedButton(
+                    onClick = {
+                        val action = if (recState.isPaused) VoiceRecorderService.ACTION_RESUME else VoiceRecorderService.ACTION_PAUSE
+                        ctx.startService(android.content.Intent(ctx, VoiceRecorderService::class.java).apply { this.action = action })
+                    },
+                    enabled = !recState.isProcessing,
+                    shape = RoundedCornerShape(10.dp),
+                    border = BorderStroke(1.dp, if (recState.isPaused) OrbGreen else OrbBorder),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                    modifier = Modifier.height(36.dp)
+                ) {
+                    Text(
+                        text = if (recState.isPaused) "Resume" else "Pause",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = if (recState.isPaused) OrbGreen else OrbFgStrong
+                    )
+                }
                 Button(
                     onClick = onToggleRecord,
                     enabled = !recState.isProcessing,
