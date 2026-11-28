@@ -458,10 +458,10 @@ object SpeakerDiarizer {
         private val maxSpeakers: Int = 6
     ) {
         private val useNeural = neuralEngine != null
-        // Calibrated on Razr 60 Ultra live telemetry (WeSpeaker ResNet293-LM, no AS-Norm):
-        //   different speakers ~0.05..0.24, same speaker short clip ~0.38..0.48, long clip ~0.55..0.75
-        private val matchThreshold: Float = if (useNeural) 0.33f else 0.72f
-        private val minVoicedFramesForNewSpeaker: Int = if (useNeural) 22 else 10 // >= 2.2s to spawn new speaker
+        // Calibrated on Razr 60 Ultra live room telemetry (WeSpeaker ResNet293-LM, no AS-Norm):
+        //   different speakers in a shared room ~0.40..0.60, same speaker ~0.68..0.90
+        private val matchThreshold: Float = if (useNeural) 0.62f else 0.82f
+        private val minVoicedFramesForNewSpeaker: Int = if (useNeural) 12 else 10 // >= 1.2s to spawn new speaker
 
         private val centroids = mutableListOf<FloatArray>()
         private val meanF0 = mutableListOf<Float>()
