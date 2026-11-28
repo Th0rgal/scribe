@@ -627,14 +627,46 @@ class VoiceRecorderService : Service() {
 
         // Optional ElevenLabs Scribe v2 Realtime WebSocket STT (falls back automatically to local Parakeet NPU)
         val elCfg = OrbRouterConfig.load(this)
+        val elPreviewTranslateInFlight = AtomicBoolean(false)
+        var elLastPreviewTranslateMs = 0L
+        var elLastPreviewTranslatedText = ""
         val elevenLabsClient: ElevenLabsScribeClient? = if (elCfg.elevenLabsApiKey.isNotBlank()) {
             ElevenLabsScribeClient(
                 apiKey = elCfg.elevenLabsApiKey,
                 sampleRate = SAMPLE_RATE,
                 vadSilenceThresholdSecs = 1.3,
                 onPartial = { text ->
-                    if (recording.get()) {
-                        _state.value = _state.value.copy(partialText = text)
+                    if (!recording.get()) return@ElevenLabsScribeClient
+                    _state.value = _state.value.copy(partialText = text)
+                    val orbCfgPrev = OrbRouterConfig.load(this)
+                    val wantLiveTx = translateModeActive || orbCfgPrev.autoTranslateTarget.isNotBlank()
+                    val nowMs = System.currentTimeMillis() - startTimeMs
+                    if (wantLiveTx &&
+                        text.length >= 4 &&
+                        text != elLastPreviewTranslatedText &&
+                        orbCfgPrev.isConfigured &&
+                        nowMs - elLastPreviewTranslateMs >= 400L &&
+                        elPreviewTranslateInFlight.compareAndSet(false, true)
+                    ) {
+                        elLastPreviewTranslateMs = nowMs
+                        elLastPreviewTranslatedText = text
+                        val bidirA = if (translateModeActive) translateLangA else null
+                        val bidirB = if (translateModeActive) translateLangB else null
+                        llmExecutor.execute {
+                            try {
+                                val tx = OrbRouterClient.translatePreviewFast(
+                                    cfg = orbCfgPrev,
+                                    partialText = text,
+                                    bidirectionalLangA = bidirA,
+                                    bidirectionalLangB = bidirB
+                                ).orEmpty().trim()
+                                if (tx.isNotBlank() && recording.get() && _state.value.partialText.isNotBlank()) {
+                                    _state.value = _state.value.copy(partialTranslation = tx)
+                                }
+                            } finally {
+                                elPreviewTranslateInFlight.set(false)
+                            }
+                        }
                     }
                 },
                 onCommitted = { text ->
@@ -654,18 +686,53 @@ class VoiceRecorderService : Service() {
                         currentSpeakerIndex = spkIdx
                         val cur = _state.value
                         val spkName = cur.speakerNames[spkIdx] ?: "Speaker ${spkIdx + 1}"
+                        val carriedTx = if (translateModeActive || elCfg.autoTranslateTarget.isNotBlank()) {
+                            cur.partialTranslation.trim()
+                        } else ""
+                        val targetIndex = cur.liveSegments.size
                         val seg = TranscriptSegment(
                             speakerIndex = spkIdx,
                             speakerName = spkName,
                             startMs = tStart,
                             endMs = endNow,
-                            text = text
+                            text = text,
+                            translatedText = carriedTx
                         )
                         _state.value = cur.copy(
                             activeSpeakerIndex = spkIdx,
                             partialText = "",
+                            partialTranslation = "",
                             liveSegments = cur.liveSegments + seg
                         )
+                        val orbCfgCommit = OrbRouterConfig.load(this)
+                        val shouldTx = (translateModeActive || orbCfgCommit.autoTranslateTarget.isNotBlank() || orbCfgCommit.livePolishEnabled) &&
+                            orbCfgCommit.isConfigured &&
+                            text.length >= 3
+                        if (shouldTx) {
+                            val bidirA = if (translateModeActive) translateLangA else null
+                            val bidirB = if (translateModeActive) translateLangB else null
+                            val namesSnap = _state.value.speakerNames
+                            llmExecutor.execute {
+                                val res = OrbRouterClient.polishAndTranslateLive(
+                                    cfg = orbCfgCommit,
+                                    rawText = text,
+                                    recentContext = emptyList(),
+                                    knownSpeakers = namesSnap.values,
+                                    bidirectionalLangA = bidirA,
+                                    bidirectionalLangB = bidirB
+                                ) ?: return@execute
+                                val nowState = _state.value
+                                if (targetIndex < nowState.liveSegments.size) {
+                                    val copy = nowState.liveSegments.toMutableList()
+                                    val existing = copy[targetIndex]
+                                    copy[targetIndex] = existing.copy(
+                                        text = res.cleaned.ifBlank { existing.text },
+                                        translatedText = res.translated.ifBlank { existing.translatedText }
+                                    )
+                                    _state.value = nowState.copy(liveSegments = copy)
+                                }
+                            }
+                        }
                     }
                 },
                 onFailure = { _ ->
