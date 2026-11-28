@@ -127,7 +127,7 @@ class HindsightNoteSyncer:
             headers=self._headers(token),
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=180) as resp:
             body = self._parse_mcp_response(resp.read().decode("utf-8"))
         return {
             "status": "synced",

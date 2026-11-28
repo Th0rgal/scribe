@@ -578,3 +578,11 @@ html, body, #root {
   outline: none;
 }
 .copilot-input-row input:focus { border-color: var(--blue); }
+
+.md-toolbar {
+  display: flex;
+  gap: 5px;
+  padding: 6px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-card);
+}

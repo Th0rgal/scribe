@@ -12,6 +12,17 @@ from .store import NoteStore
 
 ORBROUTER_URL = os.environ.get("ORBROUTER_URL", "https://orbrouter.thomas.md/v1").rstrip("/")
 COPILOT_MODEL = os.environ.get("SCRIBE_COPILOT_MODEL", "builtin/assistant")
+_last_edit_snapshot: Optional[tuple[str, str]] = None
+
+
+def undo_last_copilot_edit(store: NoteStore) -> dict[str, Any]:
+    global _last_edit_snapshot
+    if not _last_edit_snapshot:
+        return {"ok": False, "error": "No Copilot edit to undo"}
+    rel_path, prev_md = _last_edit_snapshot
+    _last_edit_snapshot = None
+    store.write_note(rel_path, prev_md)
+    return {"ok": True, "rel_path": rel_path}
 
 
 def resolve_orbrouter_key() -> Optional[str]:
@@ -244,10 +255,12 @@ def run_copilot_chat(
                     result = "No note is currently open."
                 else:
                     try:
+                        global _last_edit_snapshot
                         n = store.read_note(current_path)
                         src = str(args.get("search") or "")
                         dst = str(args.get("replace") or "")
                         if src and src in n["markdown"]:
+                            _last_edit_snapshot = (current_path, n["markdown"])
                             new_md = n["markdown"].replace(src, dst, 1)
                             store.write_note(current_path, new_md)
                             updated_path = current_path
@@ -261,6 +274,9 @@ def run_copilot_chat(
                     result = "No note is currently open."
                 else:
                     try:
+                        global _last_edit_snapshot
+                        prev = store.read_note(current_path)["markdown"]
+                        _last_edit_snapshot = (current_path, prev)
                         store.write_note(current_path, str(args.get("markdown") or ""))
                         updated_path = current_path
                         result = f"Replaced content of {current_path}."

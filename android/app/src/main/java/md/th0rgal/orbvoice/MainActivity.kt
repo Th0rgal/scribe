@@ -970,9 +970,9 @@ private fun CoverScreenVoiceDock(
             ) {
                 Text(
                     text = when (activeTab) {
-                        VoiceTab.LIVE -> "Trans"
+                        VoiceTab.LIVE -> "Notes"
                         VoiceTab.TRANSLATE -> "Notes"
-                        VoiceTab.NOTES -> "Rec"
+                        VoiceTab.NOTES -> "Live"
                     },
                     style = MaterialTheme.typography.labelMedium,
                     color = OrbFgStrong

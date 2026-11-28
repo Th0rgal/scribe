@@ -1047,6 +1047,10 @@ class VoiceRecorderService : Service() {
                 if (elevenLabsClient != null && elevenLabsClient.isHealthy) {
                     appendTurn(chunk, read)
                     elevenLabsClient.sendPcm(chunk, read)
+                    if (elapsed - lastUiTickMs >= 500L) {
+                        lastUiTickMs = elapsed
+                        _state.value = _state.value.copy(elapsedMs = elapsed)
+                    }
                     continue
                 }
 
@@ -1352,12 +1356,46 @@ class VoiceRecorderService : Service() {
             )
             VoiceNoteStore.saveNote(this, note)
 
+            // 2b. Auto-sync finished voice note to Hindsight immediately if token is configured
+            if (elCfg.hindsightToken.isNotBlank()) {
+                val mdFile = File(note.markdownPath)
+                if (mdFile.isFile) {
+                    val mdBody = mdFile.readText()
+                    kotlinx.coroutines.runBlocking {
+                        HindsightSyncClient.syncNote(
+                            noteId = note.id,
+                            title = note.title,
+                            markdown = mdBody,
+                            isVoice = true,
+                            apiToken = elCfg.hindsightToken
+                        )
+                    }
+                }
+            }
+
             // 3. Best-effort compress WAV -> MP3 (if ffmpeg available) and update note audioPath
             val mp3File = File(dir, "$noteId.mp3")
             if (encodeMp3ViaFfmpeg(wavFile, mp3File)) {
                 wavFile.delete()
                 note = note.copy(audioPath = mp3File.absolutePath)
                 VoiceNoteStore.saveNote(this, note)
+
+            // 2b. Auto-sync finished voice note to Hindsight immediately if token is configured
+            if (elCfg.hindsightToken.isNotBlank()) {
+                val mdFile = File(note.markdownPath)
+                if (mdFile.isFile) {
+                    val mdBody = mdFile.readText()
+                    kotlinx.coroutines.runBlocking {
+                        HindsightSyncClient.syncNote(
+                            noteId = note.id,
+                            title = note.title,
+                            markdown = mdBody,
+                            isVoice = true,
+                            apiToken = elCfg.hindsightToken
+                        )
+                    }
+                }
+            }
             }
 
             // 4. B) Post-recording full-note polish + auto-title & summary via Orb Router (builtin/fast)
@@ -1373,6 +1411,23 @@ class VoiceRecorderService : Service() {
                         engineUsed = "${note.engineUsed} · ${orbCfg.fastModel}"
                     )
                     VoiceNoteStore.saveNote(this, note)
+
+            // 2b. Auto-sync finished voice note to Hindsight immediately if token is configured
+            if (elCfg.hindsightToken.isNotBlank()) {
+                val mdFile = File(note.markdownPath)
+                if (mdFile.isFile) {
+                    val mdBody = mdFile.readText()
+                    kotlinx.coroutines.runBlocking {
+                        HindsightSyncClient.syncNote(
+                            noteId = note.id,
+                            title = note.title,
+                            markdown = mdBody,
+                            isVoice = true,
+                            apiToken = elCfg.hindsightToken
+                        )
+                    }
+                }
+            }
                 }
             }
 

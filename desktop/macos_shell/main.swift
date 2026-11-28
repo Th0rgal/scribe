@@ -38,6 +38,29 @@ final class ScribeAppDelegate: NSObject, NSApplicationDelegate {
         window.contentView = vibrancy
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+
+        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self = self, event.modifierFlags.contains(.command) else { return event }
+            switch event.charactersIgnoringModifiers?.lowercased() {
+            case "b":
+                self.webView.evaluateJavaScript("window.__SCRIBE_TOGGLE_SIDEBAR__ && window.__SCRIBE_TOGGLE_SIDEBAR__();")
+                return nil
+            case "j":
+                self.webView.evaluateJavaScript("window.__SCRIBE_TOGGLE_COPILOT__ && window.__SCRIBE_TOGGLE_COPILOT__();")
+                return nil
+            case "/":
+                self.webView.evaluateJavaScript("window.__SCRIBE_TOGGLE_MODE__ && window.__SCRIBE_TOGGLE_MODE__();")
+                return nil
+            case "k":
+                self.webView.evaluateJavaScript("window.__SCRIBE_FOCUS_SEARCH__ && window.__SCRIBE_FOCUS_SEARCH__();")
+                return nil
+            case "n":
+                self.webView.evaluateJavaScript("window.__SCRIBE_NEW_NOTE__ && window.__SCRIBE_NEW_NOTE__();")
+                return nil
+            default:
+                return event
+            }
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }

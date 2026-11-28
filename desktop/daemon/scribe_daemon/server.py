@@ -6,13 +6,14 @@ import mimetypes
 import os
 import subprocess
 import threading
+import time
 import urllib.request
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from .copilot import run_copilot_chat
+from .copilot import run_copilot_chat, undo_last_copilot_edit
 from .hindsight_sync import HindsightNoteSyncer
 from .recorder import DesktopRecorder
 from .store import NoteStore
@@ -216,15 +217,28 @@ def make_handler(store: NoteStore, syncer: HindsightNoteSyncer, ui_dir: Path, re
                     self._send_json({"reply": f"Copilot error: {exc}", "tool_calls": []}, 500)
                 return
 
+            if parsed.path == "/api/copilot/undo":
+                self._send_json(undo_last_copilot_edit(store))
+                return
+
             if parsed.path == "/api/phone/control":
                 action = str(body.get("action") or "").strip().lower()
-                try:
+                def _send_ctrl() -> dict:
                     with urllib.request.urlopen(
                         f"http://127.0.0.1:47922/api/control?action={action}", timeout=2.0
                     ) as r:
-                        self._send_json(json.loads(r.read().decode("utf-8")))
-                except Exception as exc:
-                    self._send_json({"ok": False, "error": str(exc)}, 502)
+                        return json.loads(r.read().decode("utf-8"))
+                try:
+                    self._send_json(_send_ctrl())
+                except Exception:
+                    # Auto-wake Scribe on USB-connected phone and retry
+                    try:
+                        subprocess.run(["adb", "forward", "tcp:47922", "tcp:47922"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1.5, check=False)
+                        subprocess.run(["adb", "shell", "am", "start", "-n", "md.th0rgal.orbvoice/.MainActivity"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.5, check=False)
+                        time.sleep(1.2)
+                        self._send_json(_send_ctrl())
+                    except Exception as exc:
+                        self._send_json({"ok": False, "error": str(exc)}, 502)
                 return
 
             if parsed.path == "/api/record/start":

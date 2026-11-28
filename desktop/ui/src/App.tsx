@@ -99,6 +99,7 @@ export function App() {
   const [copilotMsgs, setCopilotMsgs] = createSignal<CopilotMsg[]>([]);
   const [copilotInput, setCopilotInput] = createSignal("");
   const [copilotBusy, setCopilotBusy] = createSignal(false);
+  const [canUndoCopilot, setCanUndoCopilot] = createSignal(false);
   const [theme, setTheme] = createSignal<"dark" | "light">("dark");
 
   // Desktop voice recorder (Mic + System Audio / Google Meet)
@@ -358,6 +359,7 @@ export function App() {
         await fetchNotes();
         await openNote(data.created_path);
       } else if (data.updated_path) {
+        setCanUndoCopilot(true);
         await fetchNotes();
         await openNote(data.updated_path);
       }
@@ -366,6 +368,34 @@ export function App() {
     } finally {
       setCopilotBusy(false);
     }
+  }
+
+  async function undoCopilotEdit() {
+    const res = await fetch("/api/copilot/undo", { method: "POST", body: "{}" });
+    if (res.ok) {
+      const d = await res.json();
+      if (d.ok && d.rel_path) {
+        setCanUndoCopilot(false);
+        await openNote(d.rel_path);
+      }
+    }
+  }
+
+  function insertSnippet(snippet: string) {
+    const el = editorRef;
+    if (!el) return;
+    const start = el.selectionStart ?? markdown().length;
+    const end = el.selectionEnd ?? start;
+    const cur = markdown();
+    const next = cur.slice(0, start) + snippet + cur.slice(end);
+    setMarkdown(next);
+    clearTimeout(saveTimer);
+    saveTimer = window.setTimeout(() => saveCurrent(next), 450);
+    requestAnimationFrame(() => {
+      el.focus();
+      const pos = start + snippet.length;
+      el.setSelectionRange(pos, pos);
+    });
   }
 
   function toggleCopilot() {
@@ -648,6 +678,17 @@ export function App() {
           </div>
         </Show>
 
+        <Show when={mode() === "edit" && currentPath()}>
+          <div class="md-toolbar">
+            <button class="icon-btn" onClick={() => insertSnippet("# ")}>H1</button>
+            <button class="icon-btn" onClick={() => insertSnippet("## ")}>H2</button>
+            <button class="icon-btn" onClick={() => insertSnippet("**bold**")}>B</button>
+            <button class="icon-btn" onClick={() => insertSnippet("`code`")}>Code</button>
+            <button class="icon-btn" onClick={() => insertSnippet("$$\nE = mc^2\n$$\n")}>Math</button>
+            <button class="icon-btn" onClick={() => insertSnippet("```mermaid\nflowchart LR\n  A[Start] --> B[End]\n```\n")}>Mermaid</button>
+          </div>
+        </Show>
+
         <section class={`workspace mode-${mode()}`}>
           <textarea
             ref={editorRef}
@@ -669,7 +710,12 @@ export function App() {
         <aside class="copilot-pane">
           <div class="copilot-header">
             <span>Scribe Copilot · builtin/assistant</span>
-            <button class="icon-btn" onClick={() => setCopilotOpen(false)}>✕</button>
+            <div style="display:flex;gap:4px;">
+              <Show when={canUndoCopilot()}>
+                <button class="icon-btn" onClick={undoCopilotEdit} title="Undo last Copilot edit">↶ Undo</button>
+              </Show>
+              <button class="icon-btn" onClick={() => setCopilotOpen(false)}>✕</button>
+            </div>
           </div>
           <div class="copilot-messages">
             <Show when={copilotMsgs().length === 0}>
