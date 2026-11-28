@@ -50,6 +50,13 @@ fi
 "@locald@/bin/scribe-locald" &
 DAEMON_PID=$!
 trap 'kill "$DAEMON_PID" 2>/dev/null || true' EXIT
+for _ in $(seq 1 40); do
+  if (exec 3<>"/dev/tcp/127.0.0.1/''${SCRIBE_PORT}") 2>/dev/null; then
+    exec 3>&-
+    break
+  fi
+  sleep 0.1
+done
 exec "@out@/bin/scribe-shell" "$@"
 EOF
     substituteInPlace $out/bin/scribe \

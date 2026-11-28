@@ -1226,11 +1226,10 @@ private fun TopOrbBar(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(dotColor))
-            Text("Scribe", style = MaterialTheme.typography.titleMedium, color = OrbFgStrong)
-            if (!recState.isRecording && !recState.isProcessing) {
-                StatusChip(npuStatus.badgeLabel, if (npuStatus.isReady) OrbGreen else OrbFgMuted)
+            if (recState.isRecording) {
+                Box(modifier = Modifier.size(7.dp).clip(CircleShape).background(OrbRed))
             }
+            Text("Scribe", style = MaterialTheme.typography.titleMedium, color = OrbFgStrong)
         }
         if (recState.isRecording || recState.isProcessing) {
             // Compact Dynamic Island-style centered voice pill in the title bar
