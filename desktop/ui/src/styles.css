@@ -59,9 +59,12 @@ html, body, #root {
   min-width: 220px;
   display: flex;
   flex-direction: column;
-  background: color-mix(in srgb, var(--bg-sidebar) var(--sidebar-opacity), transparent);
+  background: rgba(18, 19, 19, 0.78);
   isolation: isolate;
   border-right: 1px solid var(--border);
+}
+[data-theme="light"] .note-rail {
+  background: rgba(246, 246, 244, 0.72);
 }
 
 .rail-header {
@@ -72,9 +75,9 @@ html, body, #root {
   border-bottom: 1px solid var(--border);
 }
 .rail-title {
-  font-family: "Michelangelus", "IBM Plex Serif", Georgia, serif;
-  font-weight: 500;
-  font-size: 17px;
+  font-family: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, sans-serif;
+  font-weight: 600;
+  font-size: 13.5px;
   letter-spacing: -0.01em;
 }
 .rail-actions { display: flex; gap: 5px; }
@@ -383,9 +386,9 @@ html, body, #root {
   max-width: 860px;
 }
 .preview h1, .preview h2, .preview h3 {
-  font-family: "Michelangelus", "IBM Plex Serif", Georgia, serif;
-  font-weight: 500;
-  letter-spacing: -0.015em;
+  font-family: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, sans-serif;
+  font-weight: 600;
+  letter-spacing: -0.02em;
   margin-top: 1.2em;
 }
 .preview code {
