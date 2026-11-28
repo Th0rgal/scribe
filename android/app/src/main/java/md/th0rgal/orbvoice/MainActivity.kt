@@ -1270,28 +1270,6 @@ private fun TopOrbBar(
                     Text("Documents/OrbVoice", style = MaterialTheme.typography.labelSmall, color = OrbFgMuted)
                 }
             }
-            if (recState.isRecording) {
-                Box(
-                    modifier = Modifier
-                        .size(34.dp)
-                        .clip(RoundedCornerShape(10.dp))
-                        .background(if (keepScreenOn) OrbAmber.copy(alpha = 0.22f) else OrbSurfaceHover)
-                        .border(
-                            1.dp,
-                            if (keepScreenOn) OrbAmber.copy(alpha = 0.65f) else OrbBorder,
-                            RoundedCornerShape(10.dp)
-                        )
-                        .clickable(onClick = onToggleKeepScreenOn),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(
-                        imageVector = Icons.Rounded.Coffee,
-                        contentDescription = if (keepScreenOn) "Stay Awake ON" else "Stay Awake OFF",
-                        tint = if (keepScreenOn) OrbAmber else OrbFgMuted,
-                        modifier = Modifier.size(16.dp)
-                    )
-                }
-            }
             Box(
                 modifier = Modifier
                     .size(34.dp)

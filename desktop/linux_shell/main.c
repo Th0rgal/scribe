@@ -62,6 +62,14 @@ static gboolean on_key_pressed(
         );
         return TRUE;
     }
+    if (mod && (keyval == GDK_KEY_j || keyval == GDK_KEY_J)) {
+        webkit_web_view_evaluate_javascript(
+            WEBKIT_WEB_VIEW(s->webview),
+            "window.__SCRIBE_TOGGLE_COPILOT__ && window.__SCRIBE_TOGGLE_COPILOT__();",
+            -1, NULL, NULL, NULL, NULL, NULL
+        );
+        return TRUE;
+    }
     if (mod && (keyval == GDK_KEY_slash || keyval == GDK_KEY_KP_Divide)) {
         webkit_web_view_evaluate_javascript(
             WEBKIT_WEB_VIEW(s->webview),

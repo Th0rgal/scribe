@@ -1,6 +1,15 @@
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
+import mermaid from "mermaid";
 import { extractMathSpans } from "./mathParser";
 import { renderKatexSafe } from "./katexRender";
+
+mermaid.initialize({ startOnLoad: false, theme: "dark", securityLevel: "strict" });
+
+interface CopilotMsg {
+  role: "user" | "assistant";
+  content: string;
+  tools?: string[];
+}
 
 interface NoteMeta {
   rel_path: string;
@@ -34,6 +43,7 @@ function renderMarkdownWithKatex(md: string): string {
 
 function formatPlainMarkdown(chunk: string): string {
   let html = escapeHtml(chunk);
+  html = html.replace(/```mermaid\n([\s\S]*?)```/g, (_, code) => `<div class="mermaid-wrap"><div class="mermaid">${code}</div></div>`);
   html = html.replace(/```[\w-]*\n([\s\S]*?)```/g, (_, code) => `<pre><code>${code}</code></pre>`);
   html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
   html = html.replace(/^### (.+)$/gm, "<h3>$1</h3>");
@@ -85,6 +95,10 @@ export function App() {
   const [syncText, setSyncText] = createSignal("● Hindsight: thomas/scribe");
   const [mode, setMode] = createSignal<"preview" | "edit">("preview");
   const [sidebarOpen, setSidebarOpen] = createSignal(true);
+  const [copilotOpen, setCopilotOpen] = createSignal(false);
+  const [copilotMsgs, setCopilotMsgs] = createSignal<CopilotMsg[]>([]);
+  const [copilotInput, setCopilotInput] = createSignal("");
+  const [copilotBusy, setCopilotBusy] = createSignal(false);
   const [theme, setTheme] = createSignal<"dark" | "light">("dark");
 
   // Desktop voice recorder (Mic + System Audio / Google Meet)
@@ -110,9 +124,28 @@ export function App() {
   let recTimer: number | undefined;
   let searchInputRef: HTMLInputElement | undefined;
   let editorRef: HTMLTextAreaElement | undefined;
+  let copilotInputRef: HTMLInputElement | undefined;
 
   createEffect(() => {
-    document.documentElement.dataset.theme = theme();
+    const t = theme();
+    document.documentElement.dataset.theme = t;
+    mermaid.initialize({ startOnLoad: false, theme: t === "dark" ? "dark" : "default", securityLevel: "strict" });
+  });
+
+  function renderMermaidDiagrams() {
+    requestAnimationFrame(() => {
+      const nodes = document.querySelectorAll<HTMLElement>(".mermaid:not([data-processed])");
+      if (nodes.length > 0) {
+        mermaid.run({ nodes }).catch(() => {});
+      }
+    });
+  }
+
+  createEffect(() => {
+    previewHtml();
+    copilotMsgs();
+    mode();
+    renderMermaidDiagrams();
   });
 
   const filteredNotes = createMemo(() => {
@@ -300,6 +333,47 @@ export function App() {
     }
   }
 
+  async function sendCopilot() {
+    const q = copilotInput().trim();
+    if (!q || copilotBusy()) return;
+    const nextMsgs: CopilotMsg[] = [...copilotMsgs(), { role: "user", content: q }];
+    setCopilotMsgs(nextMsgs);
+    setCopilotInput("");
+    setCopilotBusy(true);
+    try {
+      const res = await fetch("/api/copilot/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          messages: nextMsgs.map((m) => ({ role: m.role, content: m.content })),
+          current_path: viewingPhoneLive() ? null : currentPath(),
+        }),
+      });
+      const data = await res.json();
+      setCopilotMsgs([
+        ...nextMsgs,
+        { role: "assistant", content: data.reply || "Done.", tools: data.tool_calls || [] },
+      ]);
+      if (data.created_path) {
+        await fetchNotes();
+        await openNote(data.created_path);
+      } else if (data.updated_path) {
+        await fetchNotes();
+        await openNote(data.updated_path);
+      }
+    } catch (e) {
+      setCopilotMsgs([...nextMsgs, { role: "assistant", content: `Error: ${e}` }]);
+    } finally {
+      setCopilotBusy(false);
+    }
+  }
+
+  function toggleCopilot() {
+    const next = !copilotOpen();
+    setCopilotOpen(next);
+    if (next) requestAnimationFrame(() => copilotInputRef?.focus());
+  }
+
   async function applySpeakerLabel() {
     const fromLabel = relabelSource();
     const toLabel = relabelTarget().trim();
@@ -327,6 +401,7 @@ export function App() {
     (window as unknown as Record<string, unknown>).__SCRIBE_NEW_NOTE__ = createNote;
     (window as unknown as Record<string, unknown>).__SCRIBE_TOGGLE_MODE__ = toggleMode;
     (window as unknown as Record<string, unknown>).__SCRIBE_TOGGLE_SIDEBAR__ = () => setSidebarOpen((v) => !v);
+    (window as unknown as Record<string, unknown>).__SCRIBE_TOGGLE_COPILOT__ = toggleCopilot;
     (window as unknown as Record<string, unknown>).__SCRIBE_FOCUS_SEARCH__ = () => {
       setSidebarOpen(true);
       requestAnimationFrame(() => searchInputRef?.focus());
@@ -344,6 +419,9 @@ export function App() {
       } else if (mod && e.key.toLowerCase() === "b") {
         e.preventDefault();
         setSidebarOpen((v) => !v);
+      } else if (mod && e.key.toLowerCase() === "j") {
+        e.preventDefault();
+        toggleCopilot();
       } else if (mod && e.key.toLowerCase() === "k") {
         e.preventDefault();
         setSidebarOpen(true);
@@ -499,6 +577,14 @@ export function App() {
           <span class="note-path">{currentPath() || "No note selected"}</span>
           <div class="mode-tabs">
             <button
+              class={"mode-btn" + (copilotOpen() ? " active" : "")}
+              onClick={toggleCopilot}
+              title="Toggle Scribe Copilot (⌘J)"
+            >
+              Copilot
+              <kbd class="kbd-hint">⌘J</kbd>
+            </button>
+            <button
               class={"mode-btn" + (mode() === "edit" ? " active" : "")}
               onClick={toggleMode}
               title="Toggle rendered preview and editable Markdown (⌘/)"
@@ -578,6 +664,47 @@ export function App() {
           <article class="preview" innerHTML={previewHtml()} />
         </section>
       </main>
+
+      <Show when={copilotOpen()}>
+        <aside class="copilot-pane">
+          <div class="copilot-header">
+            <span>Scribe Copilot · builtin/assistant</span>
+            <button class="icon-btn" onClick={() => setCopilotOpen(false)}>✕</button>
+          </div>
+          <div class="copilot-messages">
+            <Show when={copilotMsgs().length === 0}>
+              <div class="vp-empty">
+                Ask about this note, your live phone class, Hindsight memory, or ask to edit / create notes with Mermaid diagrams.
+              </div>
+            </Show>
+            <For each={copilotMsgs()}>
+              {(m) => (
+                <div class={`copilot-msg ${m.role}`}>
+                  <Show when={m.tools && m.tools.length > 0}>
+                    <div class="copilot-tools">
+                      <For each={m.tools}>{(t) => <span class="copilot-tool-chip">{t}</span>}</For>
+                    </div>
+                  </Show>
+                  <div innerHTML={renderMarkdownWithKatex(m.content)} />
+                </div>
+              )}
+            </For>
+          </div>
+          <div class="copilot-input-row">
+            <input
+              ref={copilotInputRef}
+              type="text"
+              placeholder="Ask or edit this note..."
+              value={copilotInput()}
+              onInput={(e) => setCopilotInput(e.currentTarget.value)}
+              onKeyDown={(e) => e.key === "Enter" && sendCopilot()}
+            />
+            <button class="icon-btn primary" disabled={copilotBusy()} onClick={sendCopilot}>
+              {copilotBusy() ? "…" : "Send"}
+            </button>
+          </div>
+        </aside>
+      </Show>
     </div>
   );
 }

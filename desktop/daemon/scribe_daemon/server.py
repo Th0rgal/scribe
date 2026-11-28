@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
+from .copilot import run_copilot_chat
 from .hindsight_sync import HindsightNoteSyncer
 from .recorder import DesktopRecorder
 from .store import NoteStore
@@ -200,6 +201,19 @@ def make_handler(store: NoteStore, syncer: HindsightNoteSyncer, ui_dir: Path, re
                     self._send_json({"synced": True, "remote": res})
                 except Exception as exc:
                     self._send_json({"synced": False, "error": str(exc)}, 502)
+                return
+
+            if parsed.path == "/api/copilot/chat":
+                try:
+                    res = run_copilot_chat(
+                        store=store,
+                        syncer=syncer,
+                        messages=list(body.get("messages") or []),
+                        current_path=body.get("current_path"),
+                    )
+                    self._send_json(res)
+                except Exception as exc:
+                    self._send_json({"reply": f"Copilot error: {exc}", "tool_calls": []}, 500)
                 return
 
             if parsed.path == "/api/phone/control":
