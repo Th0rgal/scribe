@@ -1,15 +1,11 @@
 CC ?= gcc
-PKG_CONFIG ?= pkg-config
 CFLAGS ?= -O2 -Wall -Wextra
-GTK_CFLAGS := $(shell $(PKG_CONFIG) --cflags gtk4 webkitgtk-6.0 2>/dev/null)
-GTK_LIBS := $(shell $(PKG_CONFIG) --libs gtk4 webkitgtk-6.0 2>/dev/null)
+PKGS := gtk+-3.0 webkit2gtk-4.1
 
 all: scribe
 
 scribe: main.c
-	$(CC) $(CFLAGS) $(GTK_CFLAGS) -o $@ $< $(GTK_LIBS) -lpthread
+	$(CC) $(CFLAGS) -o $@ $< $$(pkg-config --cflags --libs $(PKGS))
 
 clean:
 	rm -f scribe
-
-.PHONY: all clean

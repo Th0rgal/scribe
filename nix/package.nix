@@ -1,8 +1,8 @@
 { lib
 , stdenv
 , pkg-config
-, gtk4
-, webkitgtk_6_0
+, gtk3
+, webkitgtk_4_1
 , python3
 , makeWrapper
 }:
@@ -23,7 +23,7 @@ stdenv.mkDerivation {
   src = ../.;
 
   nativeBuildInputs = [ pkg-config makeWrapper ];
-  buildInputs = [ gtk4 webkitgtk_6_0 ];
+  buildInputs = [ gtk3 webkitgtk_4_1 ];
 
   buildPhase = ''
     make -C desktop/linux_shell
