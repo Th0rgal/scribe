@@ -45,13 +45,10 @@ final class ScribeAppDelegate: NSObject, NSApplicationDelegate {
             case "b":
                 self.webView.evaluateJavaScript("window.__SCRIBE_TOGGLE_SIDEBAR__ && window.__SCRIBE_TOGGLE_SIDEBAR__();")
                 return nil
-            case "j":
+            case "k":
                 self.webView.evaluateJavaScript("window.__SCRIBE_TOGGLE_COPILOT__ && window.__SCRIBE_TOGGLE_COPILOT__();")
                 return nil
-            case "/":
-                self.webView.evaluateJavaScript("window.__SCRIBE_TOGGLE_MODE__ && window.__SCRIBE_TOGGLE_MODE__();")
-                return nil
-            case "k":
+            case "f":
                 self.webView.evaluateJavaScript("window.__SCRIBE_FOCUS_SEARCH__ && window.__SCRIBE_FOCUS_SEARCH__();")
                 return nil
             case "n":

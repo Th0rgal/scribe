@@ -123,6 +123,9 @@ export function App() {
   const [phoneMarkdown, setPhoneMarkdown] = createSignal("");
   const [viewingPhoneLive, setViewingPhoneLive] = createSignal(false);
 
+  // Right-click context menu for sidebar notes
+  const [ctxMenu, setCtxMenu] = createSignal<{ x: number; y: number; path: string } | null>(null);
+
   // Quick speaker relabel for current recording
   const [relabelSource, setRelabelSource] = createSignal<string | null>(null);
   const [relabelTarget, setRelabelTarget] = createSignal("");
@@ -455,10 +458,10 @@ export function App() {
       } else if (mod && e.key.toLowerCase() === "b") {
         e.preventDefault();
         setSidebarOpen((v) => !v);
-      } else if (mod && e.key.toLowerCase() === "j") {
+      } else if (mod && e.key.toLowerCase() === "k") {
         e.preventDefault();
         toggleCopilot();
-      } else if (mod && e.key.toLowerCase() === "k") {
+      } else if (mod && e.key.toLowerCase() === "f") {
         e.preventDefault();
         setSidebarOpen(true);
         requestAnimationFrame(() => searchInputRef?.focus());
@@ -547,25 +550,22 @@ export function App() {
             {(n) => (
               <div
                 class={"note-item" + (n.rel_path === currentPath() ? " active" : "")}
-                onClick={() => openNote(n.rel_path)}
+                onClick={() => {
+                  setCtxMenu(null);
+                  openNote(n.rel_path);
+                }}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  setCtxMenu({ x: e.clientX, y: e.clientY, path: n.rel_path });
+                }}
               >
-                <button
-                  class="note-del-btn"
-                  title="Delete note"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    deleteNoteByPath(n.rel_path);
-                  }}
-                >
-                  ✕
-                </button>
                 <div class="note-item-title">{n.title}</div>
                 <div class="note-item-preview">{n.preview || "Empty note"}</div>
                 <div class="note-item-meta">
                   <Show when={n.is_voice} fallback={<span class="dot-note">Note</span>}>
-                    <span class="dot-voice">🎙 Recording</span>
+                    <span class="dot-voice">Audio</span>
                   </Show>
-                  <span class={n.synced ? "dot-synced" : ""}>{n.synced ? "● synced" : "○ local"}</span>
+                  <span class={n.synced ? "dot-synced" : ""}>{n.synced ? "· synced" : "· local"}</span>
                 </div>
               </div>
             )}
@@ -615,10 +615,10 @@ export function App() {
             <button
               class={"mode-btn" + (copilotOpen() ? " active" : "")}
               onClick={toggleCopilot}
-              title="Toggle Scribe Copilot (⌘J)"
+              title="Toggle Scribe Copilot (⌘K)"
             >
               Copilot
-              <kbd class="kbd-hint">⌘J</kbd>
+              <kbd class="kbd-hint">⌘K</kbd>
             </button>
             <button
               class={"mode-btn" + (mode() === "edit" ? " active" : "")}
@@ -638,11 +638,8 @@ export function App() {
           </div>
         </header>
 
-        <Show when={currentIsVoice() || audioPath()}>
+        <Show when={audioPath() || detectedSpeakers().length > 0}>
           <div class="recording-card">
-            <div class="recording-top">
-              <span class="voice-badge">🎙 Recording & Derived STT</span>
-            </div>
             <Show when={audioPath()}>
               {(ap) => <audio controls src={`/api/audio/${encodeURIComponent(ap())}`} />}
             </Show>
@@ -756,6 +753,38 @@ export function App() {
             </button>
           </div>
         </aside>
+      </Show>
+
+      <Show when={ctxMenu()}>
+        {(m) => (
+          <div
+            class="ctx-menu"
+            style={`left: ${m().x}px; top: ${m().y}px;`}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              class="ctx-item"
+              onClick={async () => {
+                const p = m().path;
+                setCtxMenu(null);
+                await openNote(p);
+                setMode("edit");
+              }}
+            >
+              Edit
+            </button>
+            <button
+              class="ctx-item danger"
+              onClick={async () => {
+                const p = m().path;
+                setCtxMenu(null);
+                await deleteNoteByPath(p);
+              }}
+            >
+              Delete
+            </button>
+          </div>
+        )}
       </Show>
     </div>
   );

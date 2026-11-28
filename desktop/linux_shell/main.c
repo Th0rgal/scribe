@@ -26,9 +26,9 @@ static gboolean on_key_press(GtkWidget *widget, GdkEventKey *ev, gpointer ud) {
     if (!mod) return FALSE;
     const char *js = NULL;
     if (ev->keyval == GDK_KEY_n || ev->keyval == GDK_KEY_N) js = "window.__SCRIBE_NEW_NOTE__&&window.__SCRIBE_NEW_NOTE__();";
-    else if (ev->keyval == GDK_KEY_k || ev->keyval == GDK_KEY_K) js = "window.__SCRIBE_FOCUS_SEARCH__&&window.__SCRIBE_FOCUS_SEARCH__();";
+    else if (ev->keyval == GDK_KEY_k || ev->keyval == GDK_KEY_K) js = "window.__SCRIBE_TOGGLE_COPILOT__&&window.__SCRIBE_TOGGLE_COPILOT__();";
     else if (ev->keyval == GDK_KEY_b || ev->keyval == GDK_KEY_B) js = "window.__SCRIBE_TOGGLE_SIDEBAR__&&window.__SCRIBE_TOGGLE_SIDEBAR__();";
-    else if (ev->keyval == GDK_KEY_j || ev->keyval == GDK_KEY_J) js = "window.__SCRIBE_TOGGLE_COPILOT__&&window.__SCRIBE_TOGGLE_COPILOT__();";
+    else if (ev->keyval == GDK_KEY_f || ev->keyval == GDK_KEY_F) js = "window.__SCRIBE_FOCUS_SEARCH__&&window.__SCRIBE_FOCUS_SEARCH__();";
     else if (ev->keyval == GDK_KEY_slash || ev->keyval == GDK_KEY_KP_Divide) js = "window.__SCRIBE_TOGGLE_MODE__&&window.__SCRIBE_TOGGLE_MODE__();";
     if (js) {
         webkit_web_view_evaluate_javascript(WEBKIT_WEB_VIEW(s->webview), js, -1, NULL, NULL, NULL, NULL, NULL);
@@ -44,6 +44,8 @@ int main(int argc, char **argv) {
             return 0;
         }
     }
+    g_set_prgname("scribe");
+    g_set_application_name("Scribe");
     gtk_init(&argc, &argv);
 
     ScribeShell s;
