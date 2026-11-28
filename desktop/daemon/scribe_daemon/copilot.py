@@ -172,6 +172,7 @@ def run_copilot_chat(
     messages: list[dict[str, Any]],
     current_path: Optional[str] = None,
 ) -> dict[str, Any]:
+    global _last_edit_snapshot
     api_key = resolve_orbrouter_key()
     if not api_key:
         return {
@@ -255,7 +256,6 @@ def run_copilot_chat(
                     result = "No note is currently open."
                 else:
                     try:
-                        global _last_edit_snapshot
                         n = store.read_note(current_path)
                         src = str(args.get("search") or "")
                         dst = str(args.get("replace") or "")
@@ -274,7 +274,6 @@ def run_copilot_chat(
                     result = "No note is currently open."
                 else:
                     try:
-                        global _last_edit_snapshot
                         prev = store.read_note(current_path)["markdown"]
                         _last_edit_snapshot = (current_path, prev)
                         store.write_note(current_path, str(args.get("markdown") or ""))
