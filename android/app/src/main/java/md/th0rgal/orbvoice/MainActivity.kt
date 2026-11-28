@@ -1035,12 +1035,6 @@ private fun PhoneAndCoverBody(
             Spacer(modifier = Modifier.height(14.dp))
             SegmentedTabBar(activeTab = activeTab, notesCount = notes.size, onSelect = onSelectTab)
             Spacer(modifier = Modifier.height(10.dp))
-        } else if (recState.isRecording) {
-            WaveformBarCanvas(
-                levels = recState.levels,
-                modifier = Modifier.fillMaxWidth().height(24.dp)
-            )
-            Spacer(modifier = Modifier.height(6.dp))
         }
 
         if (activeTab == VoiceTab.TRANSLATE) {
@@ -1233,7 +1227,36 @@ private fun TopOrbBar(
         ) {
             Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(dotColor))
             Text("Scribe", style = MaterialTheme.typography.titleMedium, color = OrbFgStrong)
-            StatusChip(npuStatus.badgeLabel, if (npuStatus.isReady) OrbGreen else OrbFgMuted)
+            if (!recState.isRecording && !recState.isProcessing) {
+                StatusChip(npuStatus.badgeLabel, if (npuStatus.isReady) OrbGreen else OrbFgMuted)
+            }
+        }
+        if (recState.isRecording || recState.isProcessing) {
+            // Compact Dynamic Island-style centered voice pill in the title bar
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier
+                    .clip(RoundedCornerShape(999.dp))
+                    .background(androidx.compose.ui.graphics.Color.Black.copy(alpha = 0.82f))
+                    .border(
+                        1.dp,
+                        androidx.compose.ui.graphics.Color.White.copy(alpha = 0.14f),
+                        RoundedCornerShape(999.dp)
+                    )
+                    .padding(horizontal = 12.dp, vertical = 5.dp)
+            ) {
+                MurmureFluidWaveform(
+                    barCount = 12,
+                    isProcessing = recState.isProcessing,
+                    modifier = Modifier.width(64.dp).height(16.dp)
+                )
+                Text(
+                    text = VoiceNoteStore.formatTimestamp(recState.elapsedMs),
+                    style = MaterialTheme.typography.labelSmall.copy(fontFeatureSettings = "tnum"),
+                    color = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.92f)
+                )
+            }
         }
         Row(
             verticalAlignment = Alignment.CenterVertically,
