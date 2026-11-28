@@ -25,19 +25,24 @@ function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+function stripFrontmatter(md: string): string {
+  return md.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n*/, "");
+}
+
 function renderMarkdownWithKatex(md: string): string {
-  const spans = extractMathSpans(md);
+  const clean = stripFrontmatter(md);
+  const spans = extractMathSpans(clean);
   let out = "";
   let cursor = 0;
   for (const sp of spans) {
-    out += formatPlainMarkdown(md.slice(cursor, sp.rawStart));
+    out += formatPlainMarkdown(clean.slice(cursor, sp.rawStart));
     const rendered = renderKatexSafe(sp.tex, sp.display);
     out += sp.display
       ? `<div class="katex-display-wrap">${rendered.html}</div>`
       : `<span class="katex-inline-wrap">${rendered.html}</span>`;
     cursor = sp.rawEnd;
   }
-  out += formatPlainMarkdown(md.slice(cursor));
+  out += formatPlainMarkdown(clean.slice(cursor));
   return out;
 }
 
@@ -59,18 +64,19 @@ function formatPlainMarkdown(chunk: string): string {
 }
 
 function detectSpeakers(md: string): string[] {
+  const body = stripFrontmatter(md);
   const found = new Set<string>();
   const patterns = [
     /\*\*([A-Za-zÀ-ÿ0-9 _-]{2,28})\*\*:/g,
     /\*\*([A-Za-zÀ-ÿ0-9 _-]{2,28}):\*\*/g,
-    /^([A-Za-zÀ-ÿ0-9 _-]{2,24}):\s/gm,
+    /^\[[0-9:]+\]\s*\*\*([A-Za-zÀ-ÿ0-9 _-]{2,28})\*\*:/gm,
     /\[((?:Speaker|Locuteur)\s*\d+)\]/gi,
   ];
   for (const pat of patterns) {
     let m: RegExpExecArray | null;
-    while ((m = pat.exec(md)) !== null) {
+    while ((m = pat.exec(body)) !== null) {
       const name = m[1].trim();
-      if (name && !/^(title|date|recorded_at|duration_secs|sync|tags|http|https)$/i.test(name)) {
+      if (name && !/^(id|title|date|recorded_at|duration|duration_secs|speakers|engine|audio_file|sync|tags|http|https)$/i.test(name)) {
         found.add(name);
       }
     }
